@@ -90,15 +90,15 @@ def _fsync_dir(path: Path) -> None:
 def read_latch(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> Latch | None:
     path = _latch_path(serial, state_dir)
     try:
-        raw = path.read_text()
+        entry = path.lstat()
     except FileNotFoundError:
         return None
     try:
-        data = json.loads(raw)
+        data = json.loads(path.read_text())
         return Latch(data["who"], datetime.fromisoformat(data["when"]), data["reason"])
-    except (ValueError, KeyError, TypeError):
-        # The file's existence is the latch; a corrupt record must still inhibit.
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    except (OSError, ValueError, KeyError, TypeError):
+        # Any directory entry is the latch; a corrupt or unreadable one must still inhibit.
+        mtime = datetime.fromtimestamp(entry.st_mtime, UTC)
         return Latch("unknown", mtime, f"unreadable latch file {path}")
 
 
@@ -137,6 +137,7 @@ def clear_latch(serial: str, who: str, state_dir: Path = DEFAULT_STATE_DIR) -> L
     if latch is None:
         return None
     path = _latch_path(serial, state_dir)
+    # A latch set between the read above and this unlink is removed unlogged; see #12.
     path.unlink(missing_ok=True)
     _fsync_dir(path.parent)
     log.warning(
@@ -162,9 +163,31 @@ def kill(
     """Set the inhibit latch, then take the port lock and turn the output off.
 
     The latch goes first so it blocks every later output-on even if the lock
-    times out or the device call fails; those errors still propagate.
+    times out or the device call fails. Each step runs even if the other fails.
+    The first error is raised, with any second error attached as a note.
     """
-    latch = set_latch(serial, who or getpass.getuser(), reason, state_dir)
-    with port_lock(port, lock_timeout):
-        output_off()
+    errors: list[BaseException] = []
+    latch = None
+    try:
+        latch = set_latch(serial, who or _current_user(), reason, state_dir)
+    except BaseException as exc:
+        errors.append(exc)
+    try:
+        with port_lock(port, lock_timeout):
+            output_off()
+    except BaseException as exc:
+        errors.append(exc)
+    if errors:
+        first, *rest = errors
+        for later in rest:
+            first.add_note(f"output-off also failed: {later!r}")
+        raise first
+    assert latch is not None
     return latch
+
+
+def _current_user() -> str:
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return f"uid {os.getuid()}"

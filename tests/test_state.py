@@ -198,3 +198,70 @@ def test_kill_latches_even_when_the_lock_is_busy(ctx, tmp_path, port):
     finally:
         release.set()
         holder.join(10)
+
+
+def test_kill_turns_output_off_when_the_state_dir_is_not_writable(tmp_path, port):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    os.chmod(state_dir, 0o500)
+    calls = []
+    try:
+        with pytest.raises(PermissionError):
+            state.kill(port, SERIAL, lambda: calls.append("off"), who="ci", state_dir=state_dir)
+    finally:
+        os.chmod(state_dir, 0o700)
+    assert calls == ["off"]
+
+
+def test_kill_turns_output_off_when_the_state_dir_is_a_file(tmp_path, port):
+    state_dir = tmp_path / "state"
+    state_dir.write_text("x")
+    calls = []
+    with pytest.raises(OSError):
+        state.kill(port, SERIAL, lambda: calls.append("off"), who="ci", state_dir=state_dir)
+    assert calls == ["off"]
+
+
+def test_kill_turns_output_off_when_the_serial_is_invalid(tmp_path, port):
+    calls = []
+    with pytest.raises(ValueError):
+        state.kill(port, "A/B", lambda: calls.append("off"), who="ci", state_dir=tmp_path)
+    assert calls == ["off"]
+
+
+def test_kill_reports_both_errors_when_latch_and_output_off_fail(tmp_path, port):
+    state_dir = tmp_path / "state"
+    state_dir.write_text("x")
+
+    def output_off():
+        raise TimeoutError("device gone")
+
+    with pytest.raises(OSError) as excinfo:
+        state.kill(port, SERIAL, output_off, who="ci", state_dir=state_dir)
+    assert not isinstance(excinfo.value, TimeoutError)
+    assert any("device gone" in note for note in excinfo.value.__notes__)
+
+
+def test_kill_without_who_works_when_the_user_cannot_be_looked_up(tmp_path, port, monkeypatch):
+    def no_user():
+        raise KeyError("getpwuid(): uid not found")
+
+    monkeypatch.setattr(state.getpass, "getuser", no_user)
+    calls = []
+    latch = state.kill(port, SERIAL, lambda: calls.append("off"), state_dir=tmp_path)
+    assert calls == ["off"]
+    assert latch.who
+    with pytest.raises(Inhibited):
+        state.check_not_inhibited(SERIAL, state_dir=tmp_path)
+
+
+def test_dangling_symlink_latch_still_inhibits(tmp_path):
+    (tmp_path / f"{SERIAL}.inhibit").symlink_to(tmp_path / "gone")
+    with pytest.raises(Inhibited):
+        state.check_not_inhibited(SERIAL, state_dir=tmp_path)
+
+
+def test_latch_path_that_is_a_directory_still_inhibits(tmp_path):
+    (tmp_path / f"{SERIAL}.inhibit").mkdir()
+    with pytest.raises(Inhibited):
+        state.check_not_inhibited(SERIAL, state_dir=tmp_path)
