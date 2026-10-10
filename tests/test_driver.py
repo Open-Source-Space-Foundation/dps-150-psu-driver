@@ -77,8 +77,13 @@ def index_of(port, frame):
 # Limits and ceiling
 
 
-def test_ceiling_is_10_v_3_a():
-    assert CEILING == Limit(10.0, 3.0)
+def test_ceiling_is_18_v_3_a():
+    assert CEILING == Limit(18.0, 3.0)
+
+
+def test_ceiling_survives_the_float32_wire_format_exactly():
+    assert unpack_f32(pack_f32(CEILING.voltage)) == CEILING.voltage
+    assert unpack_f32(pack_f32(CEILING.current)) == CEILING.current
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"max_voltage": 5.0}, {"max_current": 1.0}])
@@ -89,16 +94,17 @@ def test_refuses_to_construct_without_a_limit(kwargs):
 
 @pytest.mark.parametrize(
     "max_voltage, max_current",
-    [(10.01, 1.0), (5.0, 3.01), (0.0, 1.0), (5.0, -1.0), (math.nan, 1.0), (5.0, math.inf)],
+    [(18.01, 1.0), (5.0, 3.01), (0.0, 1.0), (5.0, -1.0), (math.nan, 1.0), (5.0, math.inf)],
 )
 def test_refuses_a_limit_above_the_ceiling_or_not_positive(max_voltage, max_current):
     with pytest.raises(LimitError):
         Dps150(PORT, max_voltage=max_voltage, max_current=max_current)
 
 
-def test_limit_at_the_ceiling_is_accepted():
-    supply = Dps150(PORT, max_voltage=10.0, max_current=3.0)
-    assert supply.limit == Limit(10.0, 3.0)
+@pytest.mark.parametrize("max_voltage", [10.0, 10.01, 18.0])
+def test_limit_at_or_below_the_ceiling_is_accepted(max_voltage):
+    supply = Dps150(PORT, max_voltage=max_voltage, max_current=3.0)
+    assert supply.limit == Limit(max_voltage, 3.0)
 
 
 # Open

@@ -26,3 +26,15 @@ External kill is a one-shot CLI (`dps150 kill`) that takes the port lock. We con
 - Software alone cannot guarantee off if the host dies. Only L2 can.
 - CI must pass a lease (`PSU_LEASE_S`) and cap job time (`timeout-minutes`), so a hung job cannot hold power longer than one lease.
 - A crashed CI job does not block the runner; a thermal kill does, until a human looks.
+
+## Amendment (2026-10-09)
+
+The compiled ceiling is raised from 10 V / 3 A to 18 V / 3 A. Decision record: [#16](https://github.com/Open-Source-Space-Foundation/dps-150-psu-driver/issues/16).
+
+Rationale: future benches will simulate a solar array, which needs setpoints above 10 V. A 10 V ceiling would force a driver release for each such bench. The current ceiling stays at 3 A.
+
+Consequences:
+
+- The ceiling is now a backstop against typos and misconfiguration, not the protection sized to the board. The per-runner limit (`PSU_MAX_V`, `PSU_MAX_I`) is that protection: the clamp enforces it, and the driver programs it as the supply's OVP/OCP.
+- Every runner must declare a limit sized to its connected hardware. The CI flight controller runs at 10 V / 1.5 A.
+- The supply outputs at most about 0.2 V below its USB-PD input (register `E2`). Reaching 18 V needs a USB-PD source that negotiates at least 18.2 V.

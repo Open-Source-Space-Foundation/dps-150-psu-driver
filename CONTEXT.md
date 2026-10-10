@@ -12,9 +12,9 @@ Vocabulary for the DPS-150 driver. Use these terms in code, issues, and commits.
 
 **Setpoint**: the target voltage (`C1`) or current limit (`C2`) written to the supply. Setpoints are *declarative*: the driver writes them and reads them back before every output-on, and never trusts the front panel.
 
-**Ceiling**: the absolute maximum voltage and current compiled into the driver. No config or flag can raise it.
+**Ceiling**: the absolute maximum voltage and current compiled into the driver, 18 V / 3 A. No config or flag can raise it. The ceiling is a backstop against typos and misconfiguration; the limit is the protection sized to the connected hardware.
 
-**Limit**: the per-runner maximum voltage and current (`PSU_MAX_V`, `PSU_MAX_I`), at or below the ceiling. CLI flags may lower a limit, never raise it. With no limit configured, the driver refuses to run.
+**Limit**: the per-runner maximum voltage and current (`PSU_MAX_V`, `PSU_MAX_I`), at or below the ceiling and sized to the board the runner powers (the CI flight controller uses 10 V / 1.5 A). CLI flags may lower a limit, never raise it. With no limit configured, the driver refuses to run.
 
 **Clamp**: the software check that rejects any setpoint above the limit. A clamp rejects; it never silently reduces a value.
 
