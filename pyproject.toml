@@ -19,6 +19,7 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["sends_forbidden_command: the test itself writes a forbidden host frame on purpose"]
 
 [tool.ruff]
 target-version = "py311"
