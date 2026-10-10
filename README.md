@@ -42,3 +42,107 @@ Rules the lease depends on:
   the port lock and retries on the next poll, so a process that holds `port_lock` for a long
   time delays the forced off for as long as it holds it. Hold the lock for one command, never
   for a session.
+
+## CLI
+
+`dps150` runs one command against one supply and exits. Its core is Korad-compatible:
+`dps150 -d PORT --output 1` and `dps150 -d PORT --output 0`.
+
+```sh
+dps150 -d PORT                          # status (also --status)
+dps150 -d PORT --output 1 --lease 1200  # output on; also --output on
+dps150 -d PORT --output 0               # output off; also --output off
+dps150 -d PORT kill --reason "board hot"
+dps150 -d PORT clear-inhibit
+```
+
+Global options come before a subcommand. `--output` and a subcommand together is a usage
+error.
+
+| Option | Environment | Used by |
+|---|---|---|
+| `-d`, `--device` | `PSU_PORT` | every command |
+| | `PSU_MAX_V`, `PSU_MAX_I` | status, output on |
+| `--max-voltage`, `--max-current` | | status, output on: lowers the limit for this command |
+| `-v`, `--voltage` | `PSU_VOLTAGE` | output on |
+| `-i`, `--current` | `PSU_CURRENT` | output on |
+| `--lease SECONDS` | `PSU_LEASE_S` | output on, required, at most 6 h |
+| `--state-dir` (default `/var/lib/dps150`) | | where the inhibit latch lives |
+| `--run-dir` (default `/run/dps150`) | | where the lease lives |
+| `kill --reason TEXT` (default `kill`) | | kill |
+
+A flag overrides its environment variable. The limit comes only from the environment:
+`--max-voltage` and `--max-current` may lower it and never raise it, and they are refused
+when the environment sets no limit. Output off and kill need no limit, so they still work
+when the limit configuration is missing or broken.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Done. |
+| 1 | The supply did not do what was asked: no reply, a read-back mismatch, a setpoint the clamp rejects, or an error on the port. |
+| 2 | Usage or configuration: a bad flag, no port, a missing or unparseable limit, a flag that raises the limit, a missing setpoint, a missing lease, or a lease out of range. |
+| 3 | The supply is inhibited. A human must run `dps150 clear-inhibit`. |
+| 4 | Another process holds the port lock. |
+| 5 | The port is not a DPS-150, or the supply reports no USB serial number. |
+| 6 | The run dir is missing or not writable: `dps150-watchdog` is not installed or not running. |
+
+Status goes to stdout. Every error and warning goes to stderr with the prefix `dps150: `.
+The messages that need action are these:
+
+- `no limit configured: set PSU_MAX_V and PSU_MAX_I ...` (code 2).
+- `--max-voltage ... flags may lower a limit, never raise it` (code 2).
+- ``supply SERIAL is inhibited: latched by WHO at WHEN (REASON); a human must run
+  `dps150 clear-inhibit` before output-on`` (code 3).
+- `RUN_DIR is not a writable directory: dps150-watchdog not installed or not running (see
+  README)` (code 6).
+- ``INHIBIT LATCH IS SET for supply SERIAL but the OUTPUT MAY STILL BE ON: ERROR. Free the
+  port and run `dps150 kill` again.`` A kill could not confirm the output off.
+- `output off confirmed but INHIBIT LATCH IS NOT SET for supply SERIAL: ERROR`. A kill
+  turned the output off but could not write the latch.
+
+### What each command does
+
+**Output on** checks that the run dir exists and is writable before it touches the
+device, then takes the port lock and checks the inhibit latch. It opens a session, which
+programs OVP/OCP from the limit and reads them back, then writes and reads back the
+setpoints. It checks the latch a second time, writes the lease, and turns the output on.
+It prints `output on: V V / I A, lease until DEADLINE`.
+
+If anything fails after the lease is written, the lease stays in place. The driver already
+tries to turn the output off and confirm it when output-on fails, but the CLI cannot tell a
+confirmed off from an unconfirmed one. A lease left behind makes the watchdog force the
+output off at expiry. That is harmless on a supply that is already off, and it is the right
+action on one that is not.
+
+**Output off** takes the port lock and writes only the output register (`DB=0`), then
+reads it back. It programs no protection and needs no limit. It then removes the lease. A
+missing run dir is not an error here. With no USB serial number it still turns the output
+off, then exits 5.
+
+**Kill** sets the inhibit latch first, then waits up to 60 s for the port lock and turns
+the output off. The 60 s wait lets a long command from another process finish. It removes
+the lease only after the output off is confirmed. If the lock wait times out or the off
+fails, kill exits non-zero with the loud `OUTPUT MAY STILL BE ON` message and keeps the
+lease, so the watchdog still turns the output off at expiry.
+
+**Clear-inhibit** removes the latch and prints who set it, when, and why. It does not touch
+the device. `dps150.state` also logs the clear, with who cleared it, at WARNING on stderr.
+If a kill sets a new latch between the moment clear-inhibit reads the latch and the moment
+it removes the file, that new latch is removed without a log line. The window is one
+`lstat` wide.
+
+**Status** takes the port lock and opens a session. Opening a session programs and
+verifies OVP/OCP from the limit, so status also needs `PSU_MAX_V` and `PSU_MAX_I` and
+rewrites the supply's protection to match them. It prints one `key: value` line each for
+`model`, `firmware`, `voltage_setpoint`, `current_setpoint`, `output`, `protection`,
+`mode`, `measured_voltage`, `measured_current`, `measured_power`, `limit`, `inhibit`, and
+`lease`. It does not need the run dir; with none, `lease` is `none`.
+
+### Run as the runner account
+
+Run every `dps150` command as the runner account, the same user as `dps150-watchdog`. The
+latch and the lease live in directories that account owns, and the files are mode 0600. A
+`clear-inhibit` or `kill` from another user fails on permissions, and a lease written by
+another user is unreadable to the watchdog.
