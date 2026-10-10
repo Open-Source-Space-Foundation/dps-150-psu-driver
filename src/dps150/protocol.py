@@ -18,6 +18,9 @@ CMD_GET = 0xA1
 CMD_BAUD = 0xB0
 CMD_SET = 0xB1
 CMD_SESSION = 0xC1
+# Command 0xC0 enters firmware-update mode, recoverable only by a USB replug. It is
+# also a valid register number, so a swapped command/register argument would send it.
+ALLOWED_COMMANDS = frozenset({CMD_GET, CMD_BAUD, CMD_SET, CMD_SESSION})
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +36,8 @@ def checksum(register: int, data: bytes) -> int:
 
 
 def encode(command: int, register: int, data: bytes) -> bytes:
+    if command not in ALLOWED_COMMANDS:
+        raise ValueError(f"refusing to encode command 0x{command:02X}: not in the allowlist")
     if len(data) > 0xFF:
         raise ValueError(f"payload is {len(data)} bytes; the length field holds at most 255")
     return bytes([HOST_HEADER, command, register, len(data), *data, checksum(register, data)])

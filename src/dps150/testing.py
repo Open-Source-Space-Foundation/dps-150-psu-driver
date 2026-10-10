@@ -3,7 +3,15 @@
 import time
 from typing import Protocol
 
-from .protocol import CMD_GET, CMD_SET, DEVICE_PREFIX, HOST_HEADER, checksum, pack_f32
+from .protocol import (
+    ALLOWED_COMMANDS,
+    CMD_GET,
+    CMD_SET,
+    DEVICE_PREFIX,
+    HOST_HEADER,
+    checksum,
+    pack_f32,
+)
 
 TELEMETRY_REGISTER = 0xC3
 TELEMETRY_PERIOD_S = 0.5
@@ -35,6 +43,8 @@ class MockSerial:
     register replies with it. A SET is not echoed: sources disagree on whether the
     real device echoes, so drivers must read back with GET (see issue #6). Tests
     inject any other device bytes with `push` and inspect host writes in `written`.
+    A host frame whose command is outside ALLOWED_COMMANDS (0xC0 enters DFU on the
+    real device) raises AssertionError so the test sending it fails.
     """
 
     def __init__(self, clock: Clock = time, timeout: float | None = 1.0) -> None:
@@ -57,6 +67,8 @@ class MockSerial:
     def write(self, data: bytes) -> int:
         data = bytes(data)
         self.written.append(data)
+        if len(data) >= 2 and data[0] == HOST_HEADER and data[1] not in ALLOWED_COMMANDS:
+            raise AssertionError(f"host sent forbidden command 0x{data[1]:02X}: {data.hex(' ')}")
         if _is_valid_host_frame(data):
             command, register, payload = data[1], data[2], data[4:-1]
             if command == CMD_SET:

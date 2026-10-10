@@ -3,6 +3,7 @@ import struct
 import pytest
 
 from dps150.protocol import (
+    CMD_BAUD,
     CMD_GET,
     CMD_SESSION,
     CMD_SET,
@@ -48,6 +49,22 @@ def test_encode_allows_empty_payload():
 def test_encode_rejects_payload_longer_than_255():
     with pytest.raises(ValueError):
         encode(CMD_SET, 0xC1, bytes(256))
+
+
+@pytest.mark.parametrize("command", [CMD_GET, CMD_BAUD, CMD_SET, CMD_SESSION])
+def test_encode_accepts_every_allowlisted_command(command):
+    assert encode(command, 0x00, b"\x00")[1] == command
+
+
+@pytest.mark.parametrize("command", [0xC0, 0x00, 0xA0, 0xFF])
+def test_encode_refuses_commands_outside_the_allowlist(command):
+    with pytest.raises(ValueError, match=f"0x{command:02X}"):
+        encode(command, 0x00, b"\x00")
+
+
+def test_swapped_command_and_register_cannot_emit_the_dfu_command():
+    with pytest.raises(ValueError, match="0xC0"):
+        encode(0xC0, CMD_GET, b"\x00")
 
 
 def test_float32_little_endian_round_trip():

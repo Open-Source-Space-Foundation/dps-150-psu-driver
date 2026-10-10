@@ -1,3 +1,5 @@
+import pytest
+
 from dps150.protocol import CMD_GET, CMD_SET, Frame, FrameDecoder, encode, pack_f32, unpack_f32
 from dps150.testing import FakeClock, MockSerial
 
@@ -90,3 +92,11 @@ def test_pushed_bytes_come_out_in_order_and_split_reads_still_decode():
     while chunk := port.read(3):
         frames += decoder.feed(chunk)
     assert [f.register for f in frames] == [0xDB, 0xC3]
+
+
+@pytest.mark.parametrize("command", [0xC0, 0x00, 0xFF])
+def test_host_frame_with_a_forbidden_command_fails_the_test(command):
+    port, _ = make_port()
+    frame = bytes([0xF1, command, 0xA1, 1, 0, 0xA2])
+    with pytest.raises(AssertionError, match=f"0x{command:02X}"):
+        port.write(frame)
