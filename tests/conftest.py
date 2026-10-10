@@ -1,7 +1,22 @@
 import pytest
 
-from dps150.protocol import ALLOWED_COMMANDS, HOST_HEADER
+from dps150.protocol import ALLOWED_COMMANDS, HOST_HEADER, pack_f32
 from dps150.testing import MockSerial
+
+FACTORY_REGISTERS = {
+    0xC1: pack_f32(0.0),
+    0xC2: pack_f32(0.0),
+    0xD1: pack_f32(30.0),
+    0xD2: pack_f32(5.1),
+    0xDB: b"\x00",
+    0xDC: b"\x05",
+    0xDD: b"\x01",
+    0xDE: b"DPS-150",
+    0xDF: b"V1.0",
+    0xE0: b"V1.2",
+    0xE2: pack_f32(11.8),
+    0xE3: pack_f32(5.1),
+}
 
 
 def assert_only_allowlisted_commands(ports: list[MockSerial]) -> None:
