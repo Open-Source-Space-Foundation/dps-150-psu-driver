@@ -95,6 +95,7 @@ def test_pushed_bytes_come_out_in_order_and_split_reads_still_decode():
 
 
 @pytest.mark.parametrize("command", [0xC0, 0x00, 0xFF])
+@pytest.mark.sends_forbidden_command
 def test_host_frame_with_a_forbidden_command_fails_the_test(command):
     port, _ = make_port()
     frame = bytes([0xF1, command, 0xA1, 1, 0, 0xA2])

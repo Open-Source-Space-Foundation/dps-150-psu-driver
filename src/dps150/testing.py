@@ -45,6 +45,9 @@ class MockSerial:
     inject any other device bytes with `push` and inspect host writes in `written`.
     A host frame whose command is outside ALLOWED_COMMANDS (0xC0 enters DFU on the
     real device) raises AssertionError so the test sending it fails.
+
+    Fault injection: a SET of a register in `drop_sets` is recorded but not stored,
+    like a device that refuses the write; a GET of a register in `silent` gets no reply.
     """
 
     def __init__(self, clock: Clock = time, timeout: float | None = 1.0) -> None:
@@ -52,6 +55,9 @@ class MockSerial:
         self.telemetry = (0.0, 0.0, 0.0)
         self.written: list[bytes] = []
         self.registers: dict[int, bytes] = {}
+        self.drop_sets: set[int] = set()
+        self.silent: set[int] = set()
+        self.closed = False
         self._clock = clock
         self._rx = bytearray()
         self._next_push = clock.monotonic() + TELEMETRY_PERIOD_S
@@ -71,11 +77,17 @@ class MockSerial:
             raise AssertionError(f"host sent forbidden command 0x{data[1]:02X}: {data.hex(' ')}")
         if _is_valid_host_frame(data):
             command, register, payload = data[1], data[2], data[4:-1]
-            if command == CMD_SET:
+            if command == CMD_SET and register not in self.drop_sets:
                 self.registers[register] = payload
-            elif command == CMD_GET and register in self.registers:
-                self.push(_device_frame(register, self.registers[register]))
+            elif command == CMD_GET and register not in self.silent:
+                self._reply(register)
         return len(data)
+
+    def _reply(self, register: int) -> None:
+        if register == TELEMETRY_REGISTER:
+            self.push(_device_frame(register, _telemetry_payload(self.telemetry)))
+        elif register in self.registers:
+            self.push(_device_frame(register, self.registers[register]))
 
     def read(self, size: int = 1) -> bytes:
         deadline = None if self.timeout is None else self._clock.monotonic() + self.timeout
@@ -91,10 +103,20 @@ class MockSerial:
         del self._rx[:size]
         return data
 
+    def reset_input_buffer(self) -> None:
+        self._rx.clear()
+
+    def close(self) -> None:
+        self.closed = True
+
     def _push_due_telemetry(self) -> None:
         while self._clock.monotonic() >= self._next_push:
-            self.push(_device_frame(TELEMETRY_REGISTER, b"".join(map(pack_f32, self.telemetry))))
+            self.push(_device_frame(TELEMETRY_REGISTER, _telemetry_payload(self.telemetry)))
             self._next_push += TELEMETRY_PERIOD_S
+
+
+def _telemetry_payload(telemetry: tuple[float, float, float]) -> bytes:
+    return b"".join(map(pack_f32, telemetry))
 
 
 def _device_frame(register: int, data: bytes) -> bytes:
