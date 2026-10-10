@@ -84,7 +84,7 @@ output off, and kill still work when the limit configuration is missing or broke
 | 0 | Done. |
 | 1 | The supply did not do what was asked: no reply, a read-back mismatch, a setpoint the clamp rejects, or an error on the port. |
 | 2 | Usage or configuration: a bad flag, no port, a missing, unparseable, or above-ceiling limit, a flag that raises the limit, a missing setpoint, a missing lease, or a lease out of range. |
-| 3 | The supply is inhibited. A human must run `dps150 clear-inhibit`. |
+| 3 | The supply is inhibited, by a kill or by its own protection trip (OVP, OCP, OPP, OTP, REP, or an unknown code). A human must run `dps150 clear-inhibit`. |
 | 4 | Another process holds the port lock. |
 | 5 | No supply at the port: the port path does not exist (unplugged, or the wrong `PSU_PORT`), it is not a DPS-150, or the supply reports no USB serial number. |
 | 6 | The run dir is missing or not writable: `dps150-watchdog` is not installed or not running. |
@@ -98,7 +98,8 @@ The messages that need action are these:
   reports it with `OUTPUT MAY STILL BE ON`.
 - `--max-voltage ... flags may lower a limit, never raise it` (code 2).
 - ``supply SERIAL is inhibited: latched by WHO at WHEN (REASON); a human must run
-  `dps150 clear-inhibit` before output-on`` (code 3).
+  `dps150 clear-inhibit` before output-on`` (code 3). REASON is `device protection
+  tripped: NAME` when the supply's own protection set the latch.
 - `RUN_DIR is not a writable directory: dps150-watchdog not installed or not running (see
   README)` (code 6).
 - ``INHIBIT LATCH IS SET for supply SERIAL but the OUTPUT MAY STILL BE ON: ERROR. Free the
@@ -113,6 +114,15 @@ device, then takes the port lock and checks the inhibit latch. It opens a sessio
 programs OVP/OCP from the limit and reads them back, then writes and reads back the
 setpoints. It checks the latch a second time, writes the lease, and turns the output on.
 It prints `output on: V V / I A, lease until DEADLINE`.
+
+Before it writes `DB=1`, the driver reads the supply's protection state (register `DC`).
+After the supply's own protection trips (OVP, OCP, OPP, OTP, REP, or a code the driver
+does not know), `DC` stays latched through output-off and setpoint changes, and the next
+`SET DB=1` both clears it and turns the output on (measured on firmware V1.2,
+[#13](https://github.com/Open-Source-Space-Foundation/dps-150-psu-driver/issues/13)).
+So a trip is a board fault that the next CI cycle would silently re-energize. Output-on
+refuses it: it sets the inhibit latch with the reason `device protection tripped: NAME`
+and exits 3, like a kill. LVP is not a trip: a healthy unit on a 5 V USB input reports it.
 
 If anything fails after the lease is written, the lease stays in place. The driver already
 tries to turn the output off and confirm it when output-on fails, but the CLI cannot tell a
@@ -133,6 +143,17 @@ lease, so the watchdog still turns the output off at expiry.
 
 **Clear-inhibit** removes the latch and prints who set it, when, and why. It does not touch
 the device. `dps150.state` also logs the clear, with who cleared it, at WARNING on stderr.
+When the latch came from a protection trip, clearing it also writes a one-shot
+acknowledgement (`<serial>.ack` in the state dir) naming that trip, because only `DB=1`
+clears `DC` on the supply. The next output-on spends the acknowledgement right before it
+writes `DB=1`, whether or not `DC` still reports the trip, then proceeds if `DC` is clear
+or reports the acknowledged trip. Anything that fails after that point fails closed: a
+supply that trips again the moment it is energized is a new trip, and the next output-on
+latches it again for a human. A different trip, an unreadable acknowledgement, or a new
+latch (which discards the acknowledgement) refuses and latches again. Clearing a kill
+latch writes no acknowledgement, and neither does clearing an unreadable latch file: if
+the supply still reports a trip, the next output-on latches it with the trip named, and a
+second clear acknowledges it.
 If a kill sets a new latch between the moment clear-inhibit reads the latch and the moment
 it removes the file, that new latch is removed without a log line. The window is one
 `lstat` wide.
@@ -144,8 +165,11 @@ using, and it needs no limit. It prints one `key: value` line each for `model`, 
 `voltage_setpoint`, `current_setpoint`, `output`, `protection`, `mode`, `measured_voltage`,
 `measured_current`, `measured_power`, `ovp`, `ocp`, `max_voltage`, `inhibit`, and `lease`.
 `ovp` and `ocp` are the trips the supply holds right now, which the last output-on
-programmed; `max_voltage` is the supply's input-limited maximum (register `E2`). It does
-not need the run dir; with none, `lease` is `none`.
+programmed; `max_voltage` is the supply's input-limited maximum (register `E2`).
+`protection` carries ` (tripped)` when the supply reports a trip that output-on refuses,
+and `inhibit` says `clear (trip NAME acknowledged by WHO at WHEN; the next output-on may
+proceed)` while an acknowledgement is pending. It does not need the run dir; with none,
+`lease` is `none`.
 
 ### Run as the runner account
 

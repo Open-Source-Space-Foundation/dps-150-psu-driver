@@ -15,6 +15,7 @@ from dps150.driver import (
     LimitError,
     Measurement,
     NoReply,
+    ProtectionTripped,
     ReadbackMismatch,
     WrongDevice,
     open_serial,
@@ -897,3 +898,40 @@ def test_read_status_is_exported_from_the_package():
 
     assert dps150.read_status is driver.read_status
     assert dps150.Snapshot is driver.Snapshot
+
+
+# Device protection trip
+
+
+@pytest.mark.parametrize("code", [1, 2, 3, 4, 6, 9])
+def test_output_on_refuses_a_tripped_protection_and_writes_nothing_on(code):
+    """Catches the driver clearing a latched trip with DB=1 (bench #13)."""
+    supply, port, _ = make_supply()
+    supply.open()
+    port.registers[0xDC] = bytes([code])
+    with pytest.raises(ProtectionTripped) as excinfo:
+        supply.output(True)
+    assert excinfo.value.protection == code
+    assert OUTPUT_ON not in port.written
+    assert port.registers[0xDB] == b"\x00"
+    assert port.registers[0xDC] == bytes([code])
+
+
+def test_output_on_allowed_for_the_named_trip_only():
+    supply, port, _ = make_supply()
+    supply.open()
+    port.registers[0xDC] = b"\x01"
+    with pytest.raises(ProtectionTripped):
+        supply.output(True, allow_tripped="OCP")
+    assert OUTPUT_ON not in port.written
+    supply.output(True, allow_tripped="OVP")
+    assert port.registers[0xDB] == b"\x01"
+    assert port.registers[0xDC] == b"\x00"
+
+
+def test_status_reports_a_trip():
+    supply, port, _ = make_supply()
+    supply.open()
+    for code, tripped in ((0, False), (5, False), (1, True), (6, True), (9, True)):
+        port.registers[0xDC] = bytes([code])
+        assert supply.status().tripped is tripped, code

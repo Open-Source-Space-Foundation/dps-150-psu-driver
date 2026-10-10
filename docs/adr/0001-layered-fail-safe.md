@@ -19,6 +19,18 @@ The safety guarantees sit in layers. Each layer covers the failures the layers a
 5. **Device behavior on disconnect** (L0): measured on the bench, not assumed. If the supply turns its output off on USB loss, that becomes a free kill path.
 6. **Hardware dead-man relay** (L2): the only layer that covers a host kernel hang or a power loss. Deferred to a future issue.
 
+**Note (2026-10-10): a device protection trip escalates to the inhibit latch.** On the
+bench ([#13](https://github.com/Open-Source-Space-Foundation/dps-150-psu-driver/issues/13#issuecomment-6094429267),
+firmware V1.2) an OVP trip turned the output off and left `DC=1` latched through
+output-off and setpoint changes; the next `SET DB=1` both cleared it and turned the
+output on. Layer 2 therefore does not hold on its own across CI cycles: the next
+`--output 1` would re-energize the faulted board. Output-on now reads `DC` before `DB=1`
+and, on a trip (OVP, OCP, OPP, OTP, REP, or an unknown code; LVP is excluded, a healthy
+unit on a 5 V USB input reports it), sets the layer 3 latch with the trip named as the
+reason and exits 3. Clearing that latch leaves a one-shot acknowledgement so the next
+output-on may proceed while `DC` still reports the same trip. No new mechanism; a trip is
+a kill the supply raised itself.
+
 External kill is a one-shot CLI (`dps150 kill`) that takes the port lock. We considered a long-running daemon that owns the port, and deferred it until a monitoring need justifies one.
 
 ## Consequences

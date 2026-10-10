@@ -33,6 +33,17 @@ class Latch:
     who: str
     when: datetime
     reason: str
+    trip: str | None = None
+    """The device protection trip (OVP, OCP, ...) this latch escalates, if any."""
+
+
+@dataclass(frozen=True)
+class Ack:
+    """A human cleared a trip latch: the next output-on may proceed with DC still tripped."""
+
+    trip: str
+    who: str
+    when: datetime
 
 
 class Inhibited(Exception):
@@ -79,6 +90,10 @@ def _latch_path(serial: str, state_dir: Path) -> Path:
     return Path(state_dir) / f"{serial}.inhibit"
 
 
+def _ack_path(serial: str, state_dir: Path) -> Path:
+    return _latch_path(serial, state_dir).with_suffix(".ack")
+
+
 def _fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -95,7 +110,9 @@ def read_latch(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> Latch | None
         return None
     try:
         data = json.loads(path.read_text())
-        return Latch(data["who"], datetime.fromisoformat(data["when"]), data["reason"])
+        return Latch(
+            data["who"], datetime.fromisoformat(data["when"]), data["reason"], data.get("trip")
+        )
     except (OSError, ValueError, KeyError, TypeError):
         # Any directory entry is the latch; a corrupt or unreadable one must still inhibit.
         mtime = datetime.fromtimestamp(entry.st_mtime, UTC)
@@ -109,12 +126,31 @@ def check_not_inhibited(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> Non
         raise Inhibited(serial, latch)
 
 
-def set_latch(serial: str, who: str, reason: str, state_dir: Path = DEFAULT_STATE_DIR) -> Latch:
-    """Write the latch atomically and durably, replacing any existing one."""
+def set_latch(
+    serial: str,
+    who: str,
+    reason: str,
+    state_dir: Path = DEFAULT_STATE_DIR,
+    *,
+    trip: str | None = None,
+) -> Latch:
+    """Write the latch atomically and durably, replacing any existing one.
+
+    Any trip acknowledgement is discarded: it answered an earlier latch, not this one.
+    """
     path = _latch_path(serial, state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    latch = Latch(who, datetime.now(UTC), reason)
+    _ack_path(serial, state_dir).unlink(missing_ok=True)
+    latch = Latch(who, datetime.now(UTC), reason, trip)
     record = {"who": latch.who, "when": latch.when.isoformat(), "reason": latch.reason}
+    if trip is not None:
+        record["trip"] = trip
+    _write_record(path, record)
+    log.warning("inhibit latch set for supply %s by %s: %s", serial, who, reason)
+    return latch
+
+
+def _write_record(path: Path, record: dict[str, str]) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "w") as f:
@@ -127,16 +163,24 @@ def set_latch(serial: str, who: str, reason: str, state_dir: Path = DEFAULT_STAT
         Path(tmp).unlink(missing_ok=True)
         raise
     _fsync_dir(path.parent)
-    log.warning("inhibit latch set for supply %s by %s: %s", serial, who, reason)
-    return latch
 
 
 def clear_latch(serial: str, who: str, state_dir: Path = DEFAULT_STATE_DIR) -> Latch | None:
-    """Remove the latch and log who cleared it. Returns the cleared latch, or None if unset."""
+    """Remove the latch and log who cleared it. Returns the cleared latch, or None if unset.
+
+    Clearing a trip latch leaves a one-shot acknowledgement (`<serial>.ack`) so that the
+    next output-on may proceed while DC still reports that trip; only `SET DB=1` clears
+    DC on the supply. Output-on spends it before DB=1 whether or not it was needed.
+    """
     latch = read_latch(serial, state_dir)
     if latch is None:
         return None
     path = _latch_path(serial, state_dir)
+    # The acknowledgement goes first: a crash between the two steps then leaves the latch
+    # in place, and the next clear-inhibit converges.
+    if latch.trip is not None:
+        when = datetime.now(UTC).isoformat()
+        _write_record(_ack_path(serial, state_dir), {"trip": latch.trip, "who": who, "when": when})
     # A latch set between the read above and this unlink is removed unlogged; see #12.
     path.unlink(missing_ok=True)
     _fsync_dir(path.parent)
@@ -149,6 +193,25 @@ def clear_latch(serial: str, who: str, state_dir: Path = DEFAULT_STATE_DIR) -> L
         latch.reason,
     )
     return latch
+
+
+def read_ack(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> Ack | None:
+    """The pending trip acknowledgement, or None. An unreadable one is no acknowledgement."""
+    try:
+        data = json.loads(_ack_path(serial, state_dir).read_text())
+        return Ack(str(data["trip"]), str(data["who"]), datetime.fromisoformat(data["when"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def consume_ack(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> None:
+    """Remove the acknowledgement durably; a no-op without one."""
+    path = _ack_path(serial, state_dir)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_dir(path.parent)
 
 
 def kill(

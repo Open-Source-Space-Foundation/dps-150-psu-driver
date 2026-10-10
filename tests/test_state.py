@@ -265,3 +265,46 @@ def test_latch_path_that_is_a_directory_still_inhibits(tmp_path):
     (tmp_path / f"{SERIAL}.inhibit").mkdir()
     with pytest.raises(Inhibited):
         state.check_not_inhibited(SERIAL, state_dir=tmp_path)
+
+
+# Trip acknowledgement
+
+
+def test_clearing_a_trip_latch_leaves_an_acknowledgement_naming_the_trip(tmp_path):
+    state.set_latch(
+        SERIAL, who="ci", reason="device protection tripped: OVP", state_dir=tmp_path, trip="OVP"
+    )
+    assert state.read_latch(SERIAL, state_dir=tmp_path).trip == "OVP"
+    state.clear_latch(SERIAL, who="michael", state_dir=tmp_path)
+    ack = state.read_ack(SERIAL, state_dir=tmp_path)
+    assert ack.trip == "OVP"
+    assert ack.who == "michael"
+    assert list(tmp_path.iterdir()) == [tmp_path / f"{SERIAL}.ack"]
+
+
+def test_clearing_a_kill_latch_leaves_no_acknowledgement(tmp_path):
+    state.set_latch(SERIAL, who="thermal", reason="hot", state_dir=tmp_path)
+    state.clear_latch(SERIAL, who="michael", state_dir=tmp_path)
+    assert state.read_ack(SERIAL, state_dir=tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unreadable_acknowledgement_reads_as_none(tmp_path):
+    (tmp_path / f"{SERIAL}.ack").write_text("{not json")
+    assert state.read_ack(SERIAL, state_dir=tmp_path) is None
+
+
+def test_set_latch_discards_an_acknowledgement(tmp_path):
+    state.set_latch(SERIAL, who="ci", reason="x", state_dir=tmp_path, trip="OVP")
+    state.clear_latch(SERIAL, who="michael", state_dir=tmp_path)
+    state.set_latch(SERIAL, who="thermal", reason="hot", state_dir=tmp_path)
+    assert state.read_ack(SERIAL, state_dir=tmp_path) is None
+
+
+def test_consume_ack_is_idempotent(tmp_path):
+    state.consume_ack(SERIAL, state_dir=tmp_path)
+    state.set_latch(SERIAL, who="ci", reason="x", state_dir=tmp_path, trip="OVP")
+    state.clear_latch(SERIAL, who="michael", state_dir=tmp_path)
+    state.consume_ack(SERIAL, state_dir=tmp_path)
+    state.consume_ack(SERIAL, state_dir=tmp_path)
+    assert state.read_ack(SERIAL, state_dir=tmp_path) is None
