@@ -7,6 +7,10 @@ Any failure is logged and retried on the next poll; the loop itself never dies o
 
 systemd is petted after every lease, so `WatchdogSec` only has to cover one supply's
 worst case: the lock timeout, three unanswered GETs, and a timed-out write (about 6 s).
+
+On start, before the first poll, a sweep visits every DPS-150 on USB and turns off any
+whose lease is missing or expired: after a host reboot `/run` is empty, so a supply left
+on through the reboot would otherwise have nothing to enforce.
 """
 
 from __future__ import annotations
@@ -59,6 +63,17 @@ def find_port_by_serial(serial: str) -> str | None:
     return None
 
 
+def attached_dps150_ports() -> list[str]:
+    """Device paths of every DPS-150 (by USB VID:PID) on the host."""
+    from serial.tools import list_ports
+
+    return [
+        info.device
+        for info in list_ports.comports()
+        if (info.vid, info.pid) == (driver.USB_VID, driver.USB_PID)
+    ]
+
+
 class Watchdog:
     def __init__(
         self,
@@ -66,6 +81,8 @@ class Watchdog:
         *,
         force_output_off: Callable[[str], None] = driver.force_output_off,
         find_port: Callable[[str], str | None] = find_port_by_serial,
+        attached: Callable[[], list[str]] = attached_dps150_ports,
+        usb_serial: Callable[[str], str | None] = driver.usb_serial,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT_S,
         notify: Callable[[str], object] = sd_notify,
@@ -74,6 +91,8 @@ class Watchdog:
         self.run_dir = Path(run_dir)
         self._force_output_off = force_output_off
         self._find_port = find_port
+        self._attached = attached
+        self._usb_serial = usb_serial
         self._now = now
         self._lock_timeout = lock_timeout
         self._notify = notify
@@ -113,19 +132,47 @@ class Watchdog:
         if port is None:
             raise LookupError(f"supply {lease.serial} is not on USB; lease kept")
         with port_lock(port, self._lock_timeout):
-            current = read_lease(lease.serial, self.run_dir)
-            if current is None or not current.expired(self._now()):
-                return
-            log.log(
-                logging.DEBUG if lease.serial in self._failing else logging.WARNING,
-                "lease for supply %s expired at %s; turning output off on %s",
-                lease.serial,
-                current.deadline.isoformat() if current.deadline else "unreadable",
-                port,
-            )
-            self._force_output_off(port)
-            clear_lease(lease.serial, self.run_dir)
-        log.warning("output off confirmed on supply %s; lease removed", lease.serial)
+            self._enforce_locked(lease.serial, port)
+
+    def sweep(self) -> None:
+        """Turn off every attached DPS-150 whose lease is missing or expired.
+
+        Runs once at startup. A port whose lock is held belongs to a job mid-command;
+        it is skipped and left to that job's lease.
+        """
+        for port in self._attached():
+            try:
+                with port_lock(port, self._lock_timeout):
+                    serial = self._usb_serial(port)
+                    if serial is None:
+                        raise LookupError("no USB serial number")
+                    self._enforce_locked(serial, port)
+            except Exception as exc:
+                log.error("startup sweep skipped %s: %s: %s", port, type(exc).__name__, exc)
+            self._notify("WATCHDOG=1")
+
+    def _enforce_locked(self, serial: str, port: str) -> None:
+        """Under the port lock: re-read the lease, and turn the output off unless it is live."""
+        current = read_lease(serial, self.run_dir)
+        if current is not None and not current.expired(self._now()):
+            return
+        if current is None:
+            state = "no lease"
+        elif current.deadline is None:
+            state = "lease unreadable"
+        else:
+            state = f"lease expired at {current.deadline.isoformat()}"
+        log.log(
+            logging.DEBUG if serial in self._failing else logging.WARNING,
+            "supply %s on %s: %s; turning output off",
+            serial,
+            port,
+            state,
+        )
+        self._force_output_off(port)
+        if current is not None:
+            clear_lease(serial, self.run_dir)
+        log.warning("output off confirmed on supply %s; lease removed", serial)
 
     def _report_failure(self, serial: str, message: str) -> None:
         if self._failing.get(serial) == message:
@@ -141,6 +188,7 @@ class Watchdog:
     def run(self, stop: threading.Event, poll_s: float = DEFAULT_POLL_S) -> None:
         self._notify("READY=1")
         try:
+            self.sweep()
             while not stop.is_set():
                 self.tick()
                 self._notify("WATCHDOG=1")

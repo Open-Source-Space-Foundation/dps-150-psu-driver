@@ -13,7 +13,7 @@ from dps150.driver import USB_PID, USB_VID, force_output_off
 from dps150.lease import lease_path, read_lease, write_lease
 from dps150.protocol import CMD_SESSION, encode
 from dps150.testing import FakeClock, MockSerial
-from dps150.watchdog import Watchdog, sd_notify
+from dps150.watchdog import Watchdog, attached_dps150_ports, sd_notify
 
 SERIAL = "ABC123"
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
@@ -43,6 +43,8 @@ class Bench:
         self.now = T0
         self.ports = {SERIAL: str(self.port_path)}
         """What USB reports: serial number to device path. A serial not listed is unplugged."""
+        self.attached: list[str] = []
+        """DPS-150 device paths the startup sweep sees."""
 
         def force_off(port):
             self.off_calls += 1
@@ -57,6 +59,8 @@ class Bench:
             self.run_dir,
             force_output_off=force_off,
             find_port=self.ports.get,
+            attached=lambda: list(self.attached),
+            usb_serial=lambda port: next((s for s, p in self.ports.items() if p == port), None),
             now=lambda: self.now,
             lock_timeout=lock_timeout,
             notify=lambda state: None,
@@ -259,6 +263,7 @@ def test_run_notifies_ready_pets_each_poll_and_announces_stopping(tmp_path):
     stop = threading.Event()
     ticks = []
     bench = Bench(tmp_path)
+    bench.attached.append(str(bench.port_path))
     bench.watchdog._notify = notified.append
     bench.watchdog.tick = lambda: ticks.append(1)
 
@@ -268,7 +273,9 @@ def test_run_notifies_ready_pets_each_poll_and_announces_stopping(tmp_path):
 
     bench.watchdog._sleep = sleep
     bench.watchdog.run(stop, poll_s=1.0)
-    assert notified == ["READY=1", "WATCHDOG=1", "WATCHDOG=1", "WATCHDOG=1", "STOPPING=1"]
+    sweep_pet, poll_pets = "WATCHDOG=1", ["WATCHDOG=1"] * 3
+    assert notified == ["READY=1", sweep_pet, *poll_pets, "STOPPING=1"]
+    assert not bench.output_is_on(), "the startup sweep ran before the first poll"
 
 
 def test_run_announces_stopping_when_interrupted(tmp_path):
@@ -386,3 +393,92 @@ def test_lease_order_rotates_with_the_clock_so_a_hanging_lease_cannot_starve_the
         bench.watchdog.tick()
         orders.add(tuple(attempted))
     assert orders == {("A", "B", "C"), ("B", "C", "A"), ("C", "A", "B")}
+
+
+def test_startup_sweep_turns_off_an_attached_supply_with_no_lease(tmp_path, caplog):
+    """After a host reboot /run is empty, so a supply left on has no lease to expire."""
+    bench = Bench(tmp_path)
+    bench.attached.append(str(bench.port_path))
+    with caplog.at_level(logging.WARNING, logger="dps150.watchdog"):
+        bench.watchdog.sweep()
+    assert not bench.output_is_on()
+    assert bench.port.written[-1] == SESSION_STOP
+    assert not bench.lease_exists()
+    assert "no lease" in caplog.text and SERIAL in caplog.text
+
+
+def test_startup_sweep_turns_off_an_expired_lease_and_removes_it(tmp_path):
+    bench = Bench(tmp_path)
+    bench.attached.append(str(bench.port_path))
+    bench.lease(60)
+    bench.now = T0 + timedelta(seconds=61)
+    bench.watchdog.sweep()
+    assert not bench.output_is_on()
+    assert not bench.lease_exists()
+
+
+def test_startup_sweep_leaves_a_live_lease_untouched(tmp_path):
+    bench = Bench(tmp_path)
+    bench.attached.append(str(bench.port_path))
+    bench.lease(60)
+    bench.now = T0 + timedelta(seconds=59)
+    bench.watchdog.sweep()
+    assert bench.output_is_on()
+    assert bench.port.written == []
+    assert bench.lease_exists()
+
+
+def test_startup_sweep_skips_a_port_another_process_holds(tmp_path, caplog):
+    bench = Bench(tmp_path, lock_timeout=0.1)
+    bench.attached.append(str(bench.port_path))
+    holder = os.open(bench.port_path, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        with caplog.at_level(logging.ERROR, logger="dps150.watchdog"):
+            bench.watchdog.sweep()
+    finally:
+        os.close(holder)
+    assert bench.output_is_on()
+    assert bench.port.written == []
+    assert "locked by another dps150 process" in caplog.text
+
+
+def test_startup_sweep_writes_nothing_to_a_device_that_is_not_a_dps150(tmp_path):
+    bench = Bench(tmp_path, usb_id=lambda path: (0x1234, 0x5678))
+    bench.attached.append(str(bench.port_path))
+    bench.watchdog.sweep()
+    assert bench.output_is_on()
+    assert bench.port.written == []
+
+
+def test_startup_sweep_pets_systemd_after_each_port_and_survives_a_failure(tmp_path):
+    bench = Bench(tmp_path)
+    bench.attached += [str(tmp_path / "missing"), str(bench.port_path)]
+    pets = []
+    bench.watchdog._notify = pets.append
+    bench.watchdog.sweep()
+    assert not bench.output_is_on()
+    assert pets == ["WATCHDOG=1", "WATCHDOG=1"]
+
+
+def test_attached_dps150_ports_filters_on_vid_pid(monkeypatch):
+    from types import SimpleNamespace
+
+    from serial.tools import list_ports
+
+    infos = [
+        SimpleNamespace(device="/dev/ttyACM0", vid=USB_VID, pid=USB_PID),
+        SimpleNamespace(device="/dev/ttyACM1", vid=0x1234, pid=0x5678),
+        SimpleNamespace(device="/dev/ttyS0", vid=None, pid=None),
+        SimpleNamespace(device="/dev/ttyACM2", vid=USB_VID, pid=USB_PID),
+    ]
+    monkeypatch.setattr(list_ports, "comports", lambda: infos)
+    assert attached_dps150_ports() == ["/dev/ttyACM0", "/dev/ttyACM2"]
+
+
+def test_sweep_defaults_use_the_real_usb_lookups():
+    from dps150 import driver
+
+    watchdog = Watchdog()
+    assert watchdog._attached is attached_dps150_ports
+    assert watchdog._usb_serial is driver.usb_serial
