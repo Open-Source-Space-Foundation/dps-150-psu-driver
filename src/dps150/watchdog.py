@@ -171,7 +171,7 @@ class Watchdog:
         )
         self._force_output_off(port)
         if current is not None:
-            clear_lease(serial, self.run_dir)
+            clear_lease(serial, self.run_dir, only=current)
         log.warning("output off confirmed on supply %s; lease removed", serial)
 
     def _report_failure(self, serial: str, message: str) -> None:

@@ -2,7 +2,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from dps150.lease import clear_lease, lease_path, list_leases, read_lease, write_lease
+from dps150.lease import (
+    MAX_LEASE_S,
+    clear_lease,
+    lease_path,
+    list_leases,
+    read_lease,
+    write_lease,
+)
 
 SERIAL = "ABC123"
 PORT = "/dev/serial/by-id/usb-FNIRSI_DPS-150_ABC123-if00"
@@ -42,11 +49,18 @@ def test_write_creates_the_run_dir(tmp_path):
     assert lease_path(SERIAL, run_dir).exists()
 
 
-@pytest.mark.parametrize("seconds", [0, -1, float("nan")])
-def test_write_refuses_a_non_positive_lease(tmp_path, seconds):
+@pytest.mark.parametrize("seconds", [0, -1, float("nan"), float("inf"), MAX_LEASE_S + 1])
+def test_write_refuses_a_lease_outside_the_allowed_length(tmp_path, seconds):
+    """Six hours is GitHub's job maximum; a longer lease is a typo, not a job."""
     with pytest.raises(ValueError):
         write_lease(SERIAL, PORT, seconds, tmp_path, now=T0)
     assert read_lease(SERIAL, tmp_path) is None
+
+
+def test_write_accepts_the_maximum_lease(tmp_path):
+    assert MAX_LEASE_S == 6 * 3600
+    lease = write_lease(SERIAL, PORT, MAX_LEASE_S, tmp_path, now=T0)
+    assert lease.deadline == T0 + timedelta(hours=6)
 
 
 @pytest.mark.parametrize("serial", ["", ".", "..", "a/b", "../x"])
@@ -96,3 +110,20 @@ def test_a_crash_mid_write_leaves_the_old_lease_intact(tmp_path, monkeypatch):
         write_lease(SERIAL, PORT, 600, tmp_path, now=T0)
     assert read_lease(SERIAL, tmp_path).deadline == T0 + timedelta(seconds=60)
     assert [p.name for p in tmp_path.iterdir()] == [f"{SERIAL}.lease"]
+
+
+def test_clear_keeps_a_lease_renewed_since_it_was_read(tmp_path):
+    """Probe p5: a holder renews between the watchdog's re-read and its clear."""
+    seen = write_lease(SERIAL, PORT, 60, tmp_path, now=T0)
+    renewed = write_lease(SERIAL, PORT, 3600, tmp_path, now=T0)
+    assert clear_lease(SERIAL, tmp_path, only=seen) is False
+    assert read_lease(SERIAL, tmp_path) == renewed
+    assert clear_lease(SERIAL, tmp_path, only=renewed) is True
+    assert read_lease(SERIAL, tmp_path) is None
+
+
+def test_clear_with_only_removes_a_malformed_lease_it_read(tmp_path):
+    lease_path(SERIAL, tmp_path).write_text("garbage")
+    seen = read_lease(SERIAL, tmp_path)
+    assert clear_lease(SERIAL, tmp_path, only=seen) is True
+    assert read_lease(SERIAL, tmp_path) is None

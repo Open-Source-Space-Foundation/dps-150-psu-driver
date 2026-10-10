@@ -482,3 +482,20 @@ def test_sweep_defaults_use_the_real_usb_lookups():
     watchdog = Watchdog()
     assert watchdog._attached is attached_dps150_ports
     assert watchdog._usb_serial is driver.usb_serial
+
+
+def test_renew_written_outside_the_lock_during_enforcement_is_kept(tmp_path):
+    """Probe p5. The lease API does not enforce the lock, so a holder may renew between
+    the watchdog's re-read and its clear; the fresh lease must survive."""
+    bench = Bench(tmp_path)
+    bench.lease(60)
+    bench.now = T0 + timedelta(seconds=61)
+    original = bench.watchdog._force_output_off
+
+    def off_then_holder_renews(port):
+        original(port)
+        write_lease(SERIAL, bench.port_path, 3600, bench.run_dir, now=bench.now)
+
+    bench.watchdog._force_output_off = off_then_holder_renews
+    bench.watchdog.tick()
+    assert read_lease(SERIAL, bench.run_dir).deadline == bench.now + timedelta(seconds=3600)

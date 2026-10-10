@@ -17,6 +17,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 DEFAULT_RUN_DIR = Path("/run/dps150")
+# GitHub's job maximum. A longer lease is a mistake, not a job.
+MAX_LEASE_S = 6 * 3600
 
 
 @dataclass(frozen=True)
@@ -45,8 +47,8 @@ def write_lease(
     now: datetime | None = None,
 ) -> Lease:
     """Write the lease atomically, replacing any existing one. Output-on and renew both use it."""
-    if not seconds > 0:
-        raise ValueError(f"lease must be a positive number of seconds, got {seconds!r}")
+    if not 0 < seconds <= MAX_LEASE_S:
+        raise ValueError(f"lease must be between 0 and {MAX_LEASE_S} seconds, got {seconds!r}")
     path = lease_path(serial, run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     start = now if now is not None else datetime.now(UTC)
@@ -72,9 +74,15 @@ def read_lease(serial: str, run_dir: Path = DEFAULT_RUN_DIR) -> Lease | None:
     return _parse(serial, path)
 
 
-def clear_lease(serial: str, run_dir: Path = DEFAULT_RUN_DIR) -> bool:
-    """Remove the lease. Returns whether one existed."""
+def clear_lease(serial: str, run_dir: Path = DEFAULT_RUN_DIR, *, only: Lease | None = None) -> bool:
+    """Remove the lease. Returns whether one was removed.
+
+    With `only`, remove it only while the file still reads as that lease, so a renew
+    written since the caller read it is kept.
+    """
     path = lease_path(serial, run_dir)
+    if only is not None and read_lease(serial, run_dir) != only:
+        return False
     try:
         path.unlink()
     except FileNotFoundError:
