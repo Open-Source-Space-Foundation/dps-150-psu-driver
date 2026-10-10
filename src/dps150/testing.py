@@ -47,11 +47,16 @@ class MockSerial:
     real device) raises AssertionError so the test sending it fails.
 
     Fault injection: a SET of a register in `drop_sets` is recorded but not stored,
-    like a device that refuses the write; a GET of a register in `silent` gets no reply.
+    like a device that refuses the write; a GET of a register in `silent` gets no reply;
+    with `echo_sets` every valid SET is echoed as a device frame carrying the written
+    payload, stored or not, like a device whose echo says nothing about acceptance.
     """
 
-    def __init__(self, clock: Clock = time, timeout: float | None = 1.0) -> None:
+    def __init__(
+        self, clock: Clock = time, timeout: float | None = 1.0, *, echo_sets: bool = False
+    ) -> None:
         self.timeout = timeout
+        self.echo_sets = echo_sets
         self.telemetry = (0.0, 0.0, 0.0)
         self.written: list[bytes] = []
         self.registers: dict[int, bytes] = {}
@@ -77,8 +82,11 @@ class MockSerial:
             raise AssertionError(f"host sent forbidden command 0x{data[1]:02X}: {data.hex(' ')}")
         if _is_valid_host_frame(data):
             command, register, payload = data[1], data[2], data[4:-1]
-            if command == CMD_SET and register not in self.drop_sets:
-                self.registers[register] = payload
+            if command == CMD_SET:
+                if register not in self.drop_sets:
+                    self.registers[register] = payload
+                if self.echo_sets:
+                    self.push(_device_frame(register, payload))
             elif command == CMD_GET and register not in self.silent:
                 self._reply(register)
         return len(data)

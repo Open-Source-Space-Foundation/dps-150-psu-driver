@@ -12,6 +12,9 @@ from .driver import (
     ReadbackMismatch,
     Status,
     WrongDevice,
+    force_output_off,
+    usb_id,
+    usb_serial,
 )
 
 __all__ = [
@@ -26,4 +29,7 @@ __all__ = [
     "ReadbackMismatch",
     "Status",
     "WrongDevice",
+    "force_output_off",
+    "usb_id",
+    "usb_serial",
 ]

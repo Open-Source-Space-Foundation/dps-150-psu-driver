@@ -2,13 +2,14 @@
 device-protection guarantees of ADR 0001 layers 1 and 2.
 
 Every write is confirmed by an explicit GET of the register, never by an echo or a
-pushed frame. Closing the session leaves the output as it is: only `output(False)`
-turns it off.
+pushed frame, and a read-back that is not finite fails the check. Closing the session
+leaves the output as it is: only `output(False)` and `force_output_off()` turn it off.
 """
 
 from __future__ import annotations
 
 import math
+import numbers
 import os
 import time
 from collections.abc import Callable
@@ -72,7 +73,7 @@ class NoReply(Dps150Error):
 
 
 class ReadbackMismatch(Dps150Error):
-    """A register read back a value other than the one written."""
+    """A register read back a value other than the one written, or a non-finite value."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,15 +109,27 @@ class SerialPort(Protocol):
     def close(self) -> None: ...
 
 
-def usb_id(path: str | os.PathLike[str]) -> tuple[int, int] | None:
-    """USB (vid, pid) of the serial device at `path`, following by-id symlinks."""
+def _usb_port(path: str | os.PathLike[str]):
+    """The `list_ports` entry for the USB serial device at `path`, following by-id symlinks."""
     from serial.tools import list_ports
 
     device = os.path.realpath(path)
     for info in list_ports.comports():
         if os.path.realpath(info.device) == device and info.vid is not None:
-            return (info.vid, info.pid)
+            return info
     return None
+
+
+def usb_id(path: str | os.PathLike[str]) -> tuple[int, int] | None:
+    """USB (vid, pid) of the serial device at `path`."""
+    info = _usb_port(path)
+    return None if info is None else (info.vid, info.pid)
+
+
+def usb_serial(path: str | os.PathLike[str]) -> str | None:
+    """USB serial number of the serial device at `path`; the key of the latch and the lease."""
+    info = _usb_port(path)
+    return None if info is None else info.serial_number
 
 
 def open_serial(path: str | os.PathLike[str]) -> SerialPort:
@@ -131,8 +144,12 @@ class Dps150:
 
     `open()` checks the USB identity, starts the session, reads the model and firmware,
     and programs the supply's OVP/OCP from the limit, reading them back. `close()`
-    stops the session and does not change the output. Only `output(False)` turns the
-    output off.
+    stops the session and does not change the output. Only `output(False)` and
+    `force_output_off()` turn the output off.
+
+    `set_voltage` also refuses a setpoint above E2, the maximum the supply derives from
+    its input voltage. On a 5 V USB input E2 is about 4.79 V, so a 5 V setpoint is
+    refused until the supply has a higher input.
     """
 
     def __init__(
@@ -143,6 +160,7 @@ class Dps150:
         *,
         serial_factory: Callable[[str | os.PathLike[str]], SerialPort] = open_serial,
         usb_id: Callable[[str | os.PathLike[str]], tuple[int, int] | None] = usb_id,
+        usb_serial: Callable[[str | os.PathLike[str]], str | None] = usb_serial,
         clock=time,
     ) -> None:
         self.port = port
@@ -151,6 +169,7 @@ class Dps150:
         self.firmware: str | None = None
         self._serial_factory = serial_factory
         self._usb_id = usb_id
+        self._usb_serial = usb_serial
         self._clock = clock
         self._serial: SerialPort | None = None
         self._decoder = FrameDecoder()
@@ -169,9 +188,26 @@ class Dps150:
     def is_open(self) -> bool:
         return self._serial is not None
 
+    @property
+    def serial_number(self) -> str | None:
+        return self._usb_serial(self.port)
+
     def open(self) -> None:
         if self._serial is not None:
             return
+        self._start_session()
+        try:
+            self.model = self._get_str(REG_MODEL)
+            self.firmware = self._get_str(REG_FIRMWARE)
+            self._program_protection()
+        except BaseException as exc:
+            # The output may be on from an earlier session, and stopping the session
+            # does not de-energize it. Neither cleanup failure may hide the cause.
+            self._attempt(self._output_off, exc, "output off")
+            self._attempt(self._end_session, exc, "session stop")
+            raise
+
+    def _start_session(self) -> None:
         ids = self._usb_id(self.port)
         if ids != (USB_VID, USB_PID):
             found = "no USB identity" if ids is None else f"{ids[0]:04x}:{ids[1]:04x}"
@@ -180,15 +216,7 @@ class Dps150:
         self._serial.timeout = POLL_TIMEOUT_S
         try:
             self._send(CMD_SESSION, 0x00, b"\x01")
-            # Bytes queued before the session can hold a false F0 A1 header that stalls
-            # the decoder; drop them once the device has had a command interval to settle.
-            self._clock.sleep(COMMAND_SPACING_S)
-            self._serial.reset_input_buffer()
-            self._decoder = FrameDecoder()
-            self.model = self._get_str(REG_MODEL)
-            self.firmware = self._get_str(REG_FIRMWARE)
-            self._program_protection()
-        except Exception:
+        except BaseException:
             self._end_session()
             raise
 
@@ -201,7 +229,7 @@ class Dps150:
         self._require_open()
         _clamp(volts, self.limit.voltage, "V")
         max_voltage = self._get_f32(REG_MAX_VOLTAGE)
-        if volts > max_voltage:
+        if not volts <= max_voltage:
             raise ClampError(
                 f"{volts} V is above the supply's input-limited maximum {max_voltage:.2f} V"
             )
@@ -224,18 +252,28 @@ class Dps150:
         """
         self._require_open()
         if not on:
-            self._send(CMD_SET, REG_OUTPUT, b"\x00")
-            self._verify_u8(REG_OUTPUT, 0, "output")
+            self._output_off()
             return
         try:
             self._verify_protection()
             self._verify_setpoints()
             self._send(CMD_SET, REG_OUTPUT, b"\x01")
             self._verify_u8(REG_OUTPUT, 1, "output")
-        except Exception:
-            self._send(CMD_SET, REG_OUTPUT, b"\x00")
-            self._verify_u8(REG_OUTPUT, 0, "output")
+        except BaseException as exc:
+            self._attempt(self._output_off, exc, "output off")
             raise
+
+    def _output_off(self) -> None:
+        self._send(CMD_SET, REG_OUTPUT, b"\x00")
+        self._verify_u8(REG_OUTPUT, 0, "output")
+
+    @staticmethod
+    def _attempt(action: Callable[[], None], original: BaseException, what: str) -> None:
+        """Run a recovery step; a failure is attached to `original`, which the caller raises."""
+        try:
+            action()
+        except BaseException as exc:
+            original.add_note(f"{what} also failed: {exc!r}")
 
     def measure(self) -> Measurement:
         self._require_open()
@@ -260,8 +298,16 @@ class Dps150:
         self._verify_protection()
 
     def _verify_protection(self) -> None:
-        self._verify_f32(REG_OVP, self.limit.voltage, VOLTAGE_TOLERANCE_V, "OVP")
-        self._verify_f32(REG_OCP, self.limit.current, CURRENT_TOLERANCE_A, "OCP")
+        ovp = self._verify_f32(REG_OVP, self.limit.voltage, VOLTAGE_TOLERANCE_V, "OVP")
+        ocp = self._verify_f32(REG_OCP, self.limit.current, CURRENT_TOLERANCE_A, "OCP")
+        if not _within_limit(ovp, self.limit.voltage):
+            raise ReadbackMismatch(
+                f"OVP: supply holds {ovp} V, above the {self.limit.voltage} V limit"
+            )
+        if not _within_limit(ocp, self.limit.current):
+            raise ReadbackMismatch(
+                f"OCP: supply holds {ocp} A, above the {self.limit.current} A limit"
+            )
 
     def _verify_setpoints(self) -> None:
         volts = self._get_f32(REG_VOLTAGE_SETPOINT)
@@ -271,13 +317,13 @@ class Dps150:
             (volts, self._declared_voltage, VOLTAGE_TOLERANCE_V, "voltage setpoint"),
             (amps, self._declared_current, CURRENT_TOLERANCE_A, "current setpoint"),
         ):
-            if declared is not None and abs(value - declared) > tolerance:
+            if declared is not None and not abs(value - declared) <= tolerance:
                 raise ReadbackMismatch(f"{what}: declared {declared}, supply holds {value}")
-        if volts > self.limit.voltage + VOLTAGE_TOLERANCE_V:
+        if not _within_limit(volts, self.limit.voltage):
             raise ClampError(f"supply holds {volts} V, above the {self.limit.voltage} V limit")
-        if amps > self.limit.current + CURRENT_TOLERANCE_A:
+        if not _within_limit(amps, self.limit.current):
             raise ClampError(f"supply holds {amps} A, above the {self.limit.current} A limit")
-        if volts > max_voltage:
+        if not volts <= max_voltage:
             raise ClampError(f"supply holds {volts} V, above its input-limited {max_voltage:.2f} V")
 
     def _require_open(self) -> None:
@@ -307,10 +353,15 @@ class Dps150:
     def _get(self, register: int) -> bytes:
         """GET a register and return the payload of its reply.
 
-        Each attempt starts a fresh decoder: a false F0 A1 header with a large length
-        byte in earlier bytes would otherwise hold the real reply back for seconds.
+        Each attempt flushes the input and starts a fresh decoder right before the
+        send: an echo of the preceding SET would otherwise pass as the read-back, and
+        a false F0 A1 header with a large length byte in earlier bytes would hold the
+        real reply back for seconds.
         """
+        assert self._serial is not None
         for _ in range(GET_ATTEMPTS):
+            self._space_commands()
+            self._serial.reset_input_buffer()
             self._decoder = FrameDecoder()
             self._send(CMD_GET, register, b"\x00")
             data = self._await(register, REPLY_TIMEOUT_S)
@@ -336,7 +387,10 @@ class Dps150:
         data = self._get(register)
         if len(data) != 4:
             raise Dps150Error(f"register 0x{register:02X} replied {len(data)} bytes, expected 4")
-        return unpack_f32(data)
+        value = unpack_f32(data)
+        if not math.isfinite(value):
+            raise ReadbackMismatch(f"register 0x{register:02X} read back {value}")
+        return value
 
     def _get_u8(self, register: int) -> int:
         data = self._get(register)
@@ -344,10 +398,11 @@ class Dps150:
             raise Dps150Error(f"register 0x{register:02X} replied {len(data)} bytes, expected 1")
         return data[0]
 
-    def _verify_f32(self, register: int, expected: float, tolerance: float, what: str) -> None:
+    def _verify_f32(self, register: int, expected: float, tolerance: float, what: str) -> float:
         actual = self._get_f32(register)
-        if abs(actual - expected) > tolerance:
+        if not abs(actual - expected) <= tolerance:
             raise ReadbackMismatch(f"{what}: wrote {expected}, supply reads {actual}")
+        return actual
 
     def _verify_u8(self, register: int, expected: int, what: str) -> None:
         actual = self._get_u8(register)
@@ -355,20 +410,64 @@ class Dps150:
             raise ReadbackMismatch(f"{what}: wrote {expected}, supply reads {actual}")
 
 
+def force_output_off(
+    port: str | os.PathLike[str],
+    *,
+    serial_factory: Callable[[str | os.PathLike[str]], SerialPort] = open_serial,
+    usb_id: Callable[[str | os.PathLike[str]], tuple[int, int] | None] = usb_id,
+    clock=time,
+) -> None:
+    """Turn the output off and confirm it by GET, with nothing else on the wire.
+
+    The emergency path for the watchdog and `kill`: no limit, no model or firmware
+    read, no protection programming. Refuses any device other than a DPS-150. Raises
+    (`ReadbackMismatch`, `NoReply`, or the port's error) when off is not confirmed.
+    """
+    # The limit is never used on this path: only DB is written.
+    supply = Dps150(
+        port,
+        CEILING.voltage,
+        CEILING.current,
+        serial_factory=serial_factory,
+        usb_id=usb_id,
+        clock=clock,
+    )
+    supply._start_session()
+    try:
+        supply._output_off()
+    except BaseException as exc:
+        supply._attempt(supply._end_session, exc, "session stop")
+        raise
+    supply._end_session()
+
+
 def _validated_limit(max_voltage: float | None, max_current: float | None) -> Limit:
     if max_voltage is None or max_current is None:
         raise LimitError("no limit configured: pass max_voltage and max_current")
     checks = ((max_voltage, CEILING.voltage, "V"), (max_current, CEILING.current, "A"))
     for value, ceiling, unit in checks:
-        if not math.isfinite(value) or value <= 0:
-            raise LimitError(f"limit {value} {unit} is not a positive number")
+        if not _is_real(value) or not math.isfinite(value) or value <= 0:
+            raise LimitError(f"limit {value!r} {unit} is not a positive number")
         if value > ceiling:
             raise LimitError(f"limit {value} {unit} is above the {ceiling} {unit} ceiling")
     return Limit(float(max_voltage), float(max_current))
 
 
 def _clamp(value: float, limit: float, unit: str) -> None:
-    if not math.isfinite(value) or value < 0:
-        raise ClampError(f"setpoint {value} {unit} is not a non-negative number")
+    if not _is_real(value) or not math.isfinite(value) or value < 0:
+        raise ClampError(f"setpoint {value!r} {unit} is not a non-negative number")
     if value > limit:
         raise ClampError(f"setpoint {value} {unit} is above the {limit} {unit} limit")
+
+
+def _is_real(value: object) -> bool:
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
+
+
+def _within_limit(value: float, limit: float) -> bool:
+    """`value` (read from the supply) is at most `limit` as the supply can hold it.
+
+    The host writes the limit as float32, which can round it up by half an ulp, so the
+    bound is the float32 image of the limit, never a tolerance.
+    """
+    return value <= unpack_f32(pack_f32(limit))
