@@ -1,0 +1,33 @@
+# Lease watchdog for the DPS-150 (ADR 0001 layer 4). Install:
+#   sudo cp packaging/systemd/dps150-watchdog.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dps150-watchdog
+# ExecStart must point at the venv that holds the dps150 package; edit it to match
+# the runner's install. User and Group must be the account the CI runner runs as,
+# because that account writes the leases and must be able to read them back.
+
+[Unit]
+Description=DPS-150 lease watchdog: turns the output off when a lease expires
+Documentation=https://github.com/Open-Source-Space-Foundation/dps-150-psu-driver
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=runner
+Group=runner
+SupplementaryGroups=dialout
+ExecStart=/opt/dps150/venv/bin/dps150-watchdog
+# /run/dps150 holds the leases. Preserve it across a restart of this unit, or the
+# leases of supplies that are on would vanish with the watchdog that enforces them.
+RuntimeDirectory=dps150
+RuntimeDirectoryPreserve=yes
+# /var/lib/dps150 holds the inhibit latches. The watchdog never writes one; the unit
+# only makes sure the directory exists with the runner's ownership.
+StateDirectory=dps150
+# The service pets systemd on every poll (default 1 s), so 10 s only trips when the
+# loop is wedged, for example on a serial write that never returns.
+WatchdogSec=10
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

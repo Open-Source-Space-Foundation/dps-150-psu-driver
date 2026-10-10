@@ -9,6 +9,7 @@ dependencies = ["pyserial>=3.5"]
 
 [project.scripts]
 dps150 = "dps150.cli:main"
+dps150-watchdog = "dps150.watchdog:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
