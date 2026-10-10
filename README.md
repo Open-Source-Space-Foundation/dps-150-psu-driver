@@ -27,5 +27,18 @@ Output-on requires a lease (ADR 0001 layer 4). The holder writes `<run_dir>/<ser
 (default `/run/dps150`) under the port lock before output-on, rewrites it to renew, and removes
 it after output-off. `dps150-watchdog` polls the directory and, when a lease has expired, takes
 the port lock and turns the output off with `force_output_off`. Expiry never sets the inhibit
-latch. Install the unit from `packaging/systemd/dps150-watchdog.service`; its comments say what
-to edit for the runner.
+latch. On start it also sweeps every DPS-150 on USB and turns off any without a live lease.
+Install the unit from `packaging/systemd/dps150-watchdog.service`; its comments say what to
+edit for the runner. On the Pi500 bench: `User=proves` and
+`ExecStart=/home/proves/dps150/.venv/bin/dps150-watchdog` (systemd does not expand `~`).
+
+Rules the lease depends on:
+
+- Never run `dps150` under `sudo`. A lease root owns with mode 0600 is unreadable to the
+  watchdog, reads as malformed, and gets the output forced off.
+- Output-on fails closed when `/run/dps150` does not exist, which means the watchdog unit
+  is not installed. Install it before powering anything.
+- The lease is only as strong as lock holders releasing the port. The watchdog waits 1 s for
+  the port lock and retries on the next poll, so a process that holds `port_lock` for a long
+  time delays the forced off for as long as it holds it. Hold the lock for one command, never
+  for a session.
