@@ -145,11 +145,15 @@ lease, so the watchdog still turns the output off at expiry.
 the device. `dps150.state` also logs the clear, with who cleared it, at WARNING on stderr.
 When the latch came from a protection trip, clearing it also writes a one-shot
 acknowledgement (`<serial>.ack` in the state dir) naming that trip, because only `DB=1`
-clears `DC` on the supply. The next output-on proceeds if `DC` is clear or still reports
-the acknowledged trip, and removes the acknowledgement once the output is confirmed on. A
-different trip, an unreadable acknowledgement, or a new latch (which discards the
-acknowledgement) refuses and latches again. Clearing a kill latch writes no
-acknowledgement.
+clears `DC` on the supply. The next output-on spends the acknowledgement right before it
+writes `DB=1`, whether or not `DC` still reports the trip, then proceeds if `DC` is clear
+or reports the acknowledged trip. Anything that fails after that point fails closed: a
+supply that trips again the moment it is energized is a new trip, and the next output-on
+latches it again for a human. A different trip, an unreadable acknowledgement, or a new
+latch (which discards the acknowledgement) refuses and latches again. Clearing a kill
+latch writes no acknowledgement, and neither does clearing an unreadable latch file: if
+the supply still reports a trip, the next output-on latches it with the trip named, and a
+second clear acknowledges it.
 If a kill sets a new latch between the moment clear-inhibit reads the latch and the moment
 it removes the file, that new latch is removed without a log line. The window is one
 `lstat` wide.

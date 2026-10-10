@@ -170,7 +170,7 @@ def clear_latch(serial: str, who: str, state_dir: Path = DEFAULT_STATE_DIR) -> L
 
     Clearing a trip latch leaves a one-shot acknowledgement (`<serial>.ack`) so that the
     next output-on may proceed while DC still reports that trip; only `SET DB=1` clears
-    DC on the supply. Output-on consumes it whether or not it was needed.
+    DC on the supply. Output-on spends it before DB=1 whether or not it was needed.
     """
     latch = read_latch(serial, state_dir)
     if latch is None:
@@ -205,7 +205,13 @@ def read_ack(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> Ack | None:
 
 
 def consume_ack(serial: str, state_dir: Path = DEFAULT_STATE_DIR) -> None:
-    _ack_path(serial, state_dir).unlink(missing_ok=True)
+    """Remove the acknowledgement durably; a no-op without one."""
+    path = _ack_path(serial, state_dir)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_dir(path.parent)
 
 
 def kill(

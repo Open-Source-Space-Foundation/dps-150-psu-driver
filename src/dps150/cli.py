@@ -278,11 +278,18 @@ def output_on(cfg: Config, serial: str | None, device: Device) -> None:
             ack = state.read_ack(serial, cfg.state_dir)
             lease = write_lease(serial, cfg.port, cfg.lease_s, cfg.run_dir)
             # A failure from here on leaves the lease in place on purpose (README, "CLI").
+            # The acknowledgement is spent before DB=1: a trip after this point is a new
+            # one, and it must not find an acknowledgement waiting for the next run.
+            state.consume_ack(serial, cfg.state_dir)
             try:
                 supply.output(True, allow_tripped=None if ack is None else ack.trip)
             except ProtectionTripped as exc:
-                raise Inhibited(serial, _latch_trip(serial, exc, cfg.state_dir)) from exc
-            state.consume_ack(serial, cfg.state_dir)
+                try:
+                    latch = _latch_trip(serial, exc, cfg.state_dir)
+                except OSError as err:
+                    exc.add_note(f"inhibit latch not written: {err!r}")
+                    raise exc from err
+                raise Inhibited(serial, latch) from exc
     print(
         f"output on: {cfg.voltage:g} V / {cfg.current:g} A, "
         f"lease until {lease.deadline.isoformat()}"

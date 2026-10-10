@@ -655,15 +655,62 @@ def test_acknowledgement_is_consumed_by_a_confirmed_output_on_even_when_unused(b
     assert _on(bench) == cli.EXIT_INHIBITED
 
 
-def test_acknowledgement_survives_a_failed_output_on(bench):
-    """Catches consuming the acknowledgement before the output is confirmed on."""
+def test_acknowledgement_is_spent_before_db_1_so_a_new_trip_latches_again(bench):
+    """Catches an acknowledgement that outlives an output-on whose DB=1 tripped the supply
+    again at once (a persistent short): the next run would match the same trip name and
+    energize the board every cycle with no human involved."""
     _trip(bench, 1)
     assert _on(bench) == cli.EXIT_INHIBITED
     assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
-    bench.serial.drop_sets = {0xDB}
+    write = bench.serial.write
+
+    def trip_again_on_output_on(data):
+        n = write(data)
+        if bytes(data) == OUTPUT_ON:
+            bench.serial.registers[0xDB] = b"\x00"
+            _trip(bench, 1)
+        return n
+
+    bench.serial.write = trip_again_on_output_on
     assert _on(bench) == cli.EXIT_DEVICE
-    bench.serial.drop_sets = set()
-    assert _on(bench) == cli.EXIT_OK
+    assert not (bench.state_dir / f"{SERIAL}.ack").exists()
+    bench.serial.write = write
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.db_writes().count(1) == 1
+    assert state.read_latch(SERIAL, bench.state_dir).reason == "device protection tripped: OVP"
+
+
+def test_acknowledgement_is_spent_even_when_output_on_fails_before_db_1(bench):
+    """Catches keeping the acknowledgement for a retry: a failure fails closed instead."""
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    write = bench.serial.write
+
+    def lose_e2_after_the_setpoints(data):
+        if bytes(data)[1:3] == bytes([CMD_SET, 0xC2]):
+            bench.serial.silent = {0xE2}
+        return write(data)
+
+    bench.serial.write = lose_e2_after_the_setpoints
+    assert _on(bench) == cli.EXIT_DEVICE
+    assert 1 not in bench.db_writes()
+    bench.serial.write = write
+    bench.serial.silent = set()
+    assert _on(bench) == cli.EXIT_INHIBITED
+
+
+def test_trip_with_an_unwritable_state_dir_still_refuses_and_names_the_trip(bench, capsys):
+    _trip(bench, 1)
+    bench.state_dir.mkdir()
+    os.chmod(bench.state_dir, 0o500)
+    try:
+        assert _on(bench) == cli.EXIT_DEVICE
+    finally:
+        os.chmod(bench.state_dir, 0o700)
+    assert 1 not in bench.db_writes()
+    err = capsys.readouterr().err
+    assert "OVP" in err and "inhibit latch not written" in err
 
 
 def test_kill_discards_an_acknowledgement(bench):
