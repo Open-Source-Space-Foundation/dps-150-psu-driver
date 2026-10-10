@@ -23,9 +23,12 @@ from .driver import (
     Dps150Error,
     Limit,
     LimitError,
+    Snapshot,
     WrongDevice,
+    _validated_limit,
     force_output_off,
     open_serial,
+    read_status,
     usb_id,
     usb_serial,
 )
@@ -64,6 +67,10 @@ class NoSerial(CliError):
     code = EXIT_WRONG_DEVICE
 
 
+class MissingPort(CliError):
+    code = EXIT_WRONG_DEVICE
+
+
 class LeaseDirUnusable(CliError):
     code = EXIT_LEASE_DIR
 
@@ -97,7 +104,7 @@ def exit_code(exc: Exception) -> int:
 class Config:
     port: str
     limit: Limit | None
-    """Parsed only for commands that open a session: output-off and kill must never fail on it."""
+    """Parsed only for output-on: no other command may fail on a broken limit."""
     voltage: float | None
     current: float | None
     lease_s: float | None
@@ -128,6 +135,11 @@ class Device:
             port, serial_factory=self.serial_factory, usb_id=self.usb_id, clock=self.clock
         )
 
+    def read_status(self, port: str) -> Snapshot:
+        return read_status(
+            port, serial_factory=self.serial_factory, usb_id=self.usb_id, clock=self.clock
+        )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dps150", description="Control a FNIRSI DPS-150.")
@@ -135,8 +147,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--voltage", type=float, help="voltage setpoint (PSU_VOLTAGE)")
     parser.add_argument("-i", "--current", type=float, help="current setpoint (PSU_CURRENT)")
     parser.add_argument("--lease", type=float, help="lease in seconds (PSU_LEASE_S)")
-    parser.add_argument("--max-voltage", type=float, help="lower PSU_MAX_V for this command")
-    parser.add_argument("--max-current", type=float, help="lower PSU_MAX_I for this command")
+    parser.add_argument("--max-voltage", type=float, help="lower PSU_MAX_V for output on")
+    parser.add_argument("--max-current", type=float, help="lower PSU_MAX_I for output on")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     mode = parser.add_mutually_exclusive_group()
@@ -145,7 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     kill = commands.add_parser("kill", help="output off and set the inhibit latch")
     kill.add_argument("--reason", default="kill")
-    commands.add_parser("clear-inhibit", help="remove the inhibit latch")
+    clear = commands.add_parser("clear-inhibit", help="remove the inhibit latch")
+    # The panic command must not fail on option order: `dps150 kill -d PORT` works too.
+    for sub in (kill, clear):
+        sub.add_argument("-d", "--device", default=argparse.SUPPRESS, help="serial port")
+        sub.add_argument("--state-dir", type=Path, default=argparse.SUPPRESS)
+        sub.add_argument("--run-dir", type=Path, default=argparse.SUPPRESS)
     return parser
 
 
@@ -167,11 +184,9 @@ def parse_config(args: argparse.Namespace, env: Mapping[str, str], command: Comm
     port = args.device or env.get("PSU_PORT")
     if not port:
         raise UsageError("no port: pass -d PORT or set PSU_PORT")
-    limit = None
-    if command in (Command.STATUS, Command.OUTPUT_ON):
-        limit = parse_limit(args, env)
-    voltage = current = lease_s = None
+    limit = voltage = current = lease_s = None
     if command is Command.OUTPUT_ON:
+        limit = parse_limit(args, env)
         voltage = _setting(args.voltage, env, "PSU_VOLTAGE", "-v")
         current = _setting(args.current, env, "PSU_CURRENT", "-i")
         lease_s = _setting(args.lease, env, "PSU_LEASE_S", "--lease")
@@ -192,6 +207,8 @@ def parse_limit(args: argparse.Namespace, env: Mapping[str, str]) -> Limit:
             "no limit configured: set PSU_MAX_V and PSU_MAX_I to positive numbers sized to "
             "the connected hardware"
         )
+    # A lowering flag must not hide an env limit above the ceiling.
+    env_limit = _validated_limit(env_limit.voltage, env_limit.current)
     voltage, current = env_limit.voltage, env_limit.current
     if args.max_voltage is not None:
         if not args.max_voltage <= env_limit.voltage:
@@ -222,6 +239,18 @@ def _setting(flag: float | None, env: Mapping[str, str], name: str, option: str)
         raise UsageError(f"{name}={raw!r} is not a number") from None
 
 
+def _missing_port(port: str) -> MissingPort | None:
+    if os.path.exists(port):
+        return None
+    return MissingPort(f"port {port} does not exist (supply unplugged or wrong PSU_PORT)")
+
+
+def require_port(port: str) -> None:
+    missing = _missing_port(port)
+    if missing is not None:
+        raise missing
+
+
 def require_serial(serial: str | None, port: str) -> str:
     if serial is None:
         raise NoSerial(f"{port}: no USB serial number; cannot key the inhibit latch or lease")
@@ -229,6 +258,7 @@ def require_serial(serial: str | None, port: str) -> str:
 
 
 def output_on(cfg: Config, serial: str | None, device: Device) -> None:
+    require_port(cfg.port)
     serial = require_serial(serial, cfg.port)
     assert cfg.limit and cfg.voltage is not None and cfg.current is not None and cfg.lease_s
     # Checked before the device so a missing watchdog fails closed and a root run
@@ -254,6 +284,7 @@ def output_on(cfg: Config, serial: str | None, device: Device) -> None:
 
 
 def output_off(cfg: Config, serial: str | None, device: Device) -> None:
+    require_port(cfg.port)
     with port_lock(cfg.port, LOCK_TIMEOUT_S):
         device.output_off(cfg.port)
         if serial is not None:
@@ -271,6 +302,8 @@ def kill(cfg: Config, serial: str | None, device: Device, reason: str) -> None:
         device.output_off(cfg.port)
         confirmed = True
 
+    # The latch is set before the port is touched, so a missing port is found only
+    # when the lock opens it. The latch must stay: the supply may be plugged back in.
     try:
         state.kill(
             cfg.port,
@@ -283,7 +316,8 @@ def kill(cfg: Config, serial: str | None, device: Device, reason: str) -> None:
     except Exception as exc:
         if confirmed and serial is not None:
             clear_lease(serial, cfg.run_dir)
-        raise _kill_incomplete(cfg, serial, confirmed, exc) from exc
+        cause = exc if confirmed else _missing_port(cfg.port) or exc
+        raise _kill_incomplete(cfg, serial, confirmed, cause) from exc
     clear_lease(serial, cfg.run_dir)
     print(f"killed: output off, inhibit latch set for supply {serial}")
 
@@ -306,6 +340,7 @@ def _kill_incomplete(
 
 
 def clear_inhibit(cfg: Config, serial: str | None) -> None:
+    require_port(cfg.port)
     serial = require_serial(serial, cfg.port)
     latch = state.clear_latch(serial, who=state._current_user(), state_dir=cfg.state_dir)
     if latch is None:
@@ -318,12 +353,11 @@ def clear_inhibit(cfg: Config, serial: str | None) -> None:
 
 
 def status(cfg: Config, serial: str | None, device: Device) -> None:
+    require_port(cfg.port)
     serial = require_serial(serial, cfg.port)
-    assert cfg.limit is not None
-    with port_lock(cfg.port, LOCK_TIMEOUT_S), device.session(cfg.port, cfg.limit) as supply:
-        st = supply.status()
-        m = supply.measure()
-        model, firmware = supply.model, supply.firmware
+    with port_lock(cfg.port, LOCK_TIMEOUT_S):
+        snap = device.read_status(cfg.port)
+    st, m = snap.status, snap.measurement
     latch = state.read_latch(serial, cfg.state_dir)
     lease = read_lease(serial, cfg.run_dir)
     if lease is None:
@@ -334,8 +368,8 @@ def status(cfg: Config, serial: str | None, device: Device) -> None:
         expired = " (expired)" if lease.expired(datetime.now(UTC)) else ""
         lease_line = f"until {lease.deadline.isoformat()}{expired}"
     lines = {
-        "model": model,
-        "firmware": firmware,
+        "model": snap.model,
+        "firmware": snap.firmware,
         "voltage_setpoint": f"{st.voltage_setpoint:.3f}",
         "current_setpoint": f"{st.current_setpoint:.3f}",
         "output": "on" if st.output else "off",
@@ -344,7 +378,9 @@ def status(cfg: Config, serial: str | None, device: Device) -> None:
         "measured_voltage": f"{m.voltage:.3f}",
         "measured_current": f"{m.current:.3f}",
         "measured_power": f"{m.power:.3f}",
-        "limit": f"{cfg.limit.voltage:g} V / {cfg.limit.current:g} A",
+        "ovp": f"{snap.ovp:.3f}",
+        "ocp": f"{snap.ocp:.3f}",
+        "max_voltage": f"{snap.max_voltage:.3f}",
         "inhibit": "clear"
         if latch is None
         else f"latched by {latch.who} at {latch.when.isoformat()}: {latch.reason}",

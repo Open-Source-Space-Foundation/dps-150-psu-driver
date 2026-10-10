@@ -53,17 +53,17 @@ dps150 -d PORT                          # status (also --status)
 dps150 -d PORT --output 1 --lease 1200  # output on; also --output on
 dps150 -d PORT --output 0               # output off; also --output off
 dps150 -d PORT kill --reason "board hot"
-dps150 -d PORT clear-inhibit
+dps150 kill -d PORT                     # same: kill and clear-inhibit take -d, --state-dir
+dps150 -d PORT clear-inhibit            # and --run-dir on either side of the subcommand
 ```
 
-Global options come before a subcommand. `--output` and a subcommand together is a usage
-error.
+`--output` and a subcommand together is a usage error.
 
 | Option | Environment | Used by |
 |---|---|---|
 | `-d`, `--device` | `PSU_PORT` | every command |
-| | `PSU_MAX_V`, `PSU_MAX_I` | status, output on |
-| `--max-voltage`, `--max-current` | | status, output on: lowers the limit for this command |
+| | `PSU_MAX_V`, `PSU_MAX_I` | output on |
+| `--max-voltage`, `--max-current` | | output on: lowers the limit for this command |
 | `-v`, `--voltage` | `PSU_VOLTAGE` | output on |
 | `-i`, `--current` | `PSU_CURRENT` | output on |
 | `--lease SECONDS` | `PSU_LEASE_S` | output on, required, at most 6 h |
@@ -73,8 +73,9 @@ error.
 
 A flag overrides its environment variable. The limit comes only from the environment:
 `--max-voltage` and `--max-current` may lower it and never raise it, and they are refused
-when the environment sets no limit. Output off and kill need no limit, so they still work
-when the limit configuration is missing or broken.
+when the environment sets no limit. An environment limit above the ceiling is a
+configuration error even when a flag lowers it. Only output on needs a limit, so status,
+output off, and kill still work when the limit configuration is missing or broken.
 
 ### Exit codes
 
@@ -82,16 +83,19 @@ when the limit configuration is missing or broken.
 |---|---|
 | 0 | Done. |
 | 1 | The supply did not do what was asked: no reply, a read-back mismatch, a setpoint the clamp rejects, or an error on the port. |
-| 2 | Usage or configuration: a bad flag, no port, a missing or unparseable limit, a flag that raises the limit, a missing setpoint, a missing lease, or a lease out of range. |
+| 2 | Usage or configuration: a bad flag, no port, a missing, unparseable, or above-ceiling limit, a flag that raises the limit, a missing setpoint, a missing lease, or a lease out of range. |
 | 3 | The supply is inhibited. A human must run `dps150 clear-inhibit`. |
 | 4 | Another process holds the port lock. |
-| 5 | The port is not a DPS-150, or the supply reports no USB serial number. |
+| 5 | No supply at the port: the port path does not exist (unplugged, or the wrong `PSU_PORT`), it is not a DPS-150, or the supply reports no USB serial number. |
 | 6 | The run dir is missing or not writable: `dps150-watchdog` is not installed or not running. |
 
 Status goes to stdout. Every error and warning goes to stderr with the prefix `dps150: `.
 The messages that need action are these:
 
 - `no limit configured: set PSU_MAX_V and PSU_MAX_I ...` (code 2).
+- `port PATH does not exist (supply unplugged or wrong PSU_PORT)` (code 5). Every command
+  checks this before it touches anything, except kill, which sets the latch first and then
+  reports it with `OUTPUT MAY STILL BE ON`.
 - `--max-voltage ... flags may lower a limit, never raise it` (code 2).
 - ``supply SERIAL is inhibited: latched by WHO at WHEN (REASON); a human must run
   `dps150 clear-inhibit` before output-on`` (code 3).
@@ -133,12 +137,15 @@ If a kill sets a new latch between the moment clear-inhibit reads the latch and 
 it removes the file, that new latch is removed without a log line. The window is one
 `lstat` wide.
 
-**Status** takes the port lock and opens a session. Opening a session programs and
-verifies OVP/OCP from the limit, so status also needs `PSU_MAX_V` and `PSU_MAX_I` and
-rewrites the supply's protection to match them. It prints one `key: value` line each for
-`model`, `firmware`, `voltage_setpoint`, `current_setpoint`, `output`, `protection`,
-`mode`, `measured_voltage`, `measured_current`, `measured_power`, `limit`, `inhibit`, and
-`lease`. It does not need the run dir; with none, `lease` is `none`.
+**Status** is read-only. It takes the port lock and reads the supply with `read_status`,
+which sends GETs only: it never writes a setpoint, the protection, or the output register,
+and a failed read leaves the output as it was. It is safe against a supply another job is
+using, and it needs no limit. It prints one `key: value` line each for `model`, `firmware`,
+`voltage_setpoint`, `current_setpoint`, `output`, `protection`, `mode`, `measured_voltage`,
+`measured_current`, `measured_power`, `ovp`, `ocp`, `max_voltage`, `inhibit`, and `lease`.
+`ovp` and `ocp` are the trips the supply holds right now, which the last output-on
+programmed; `max_voltage` is the supply's input-limited maximum (register `E2`). It does
+not need the run dir; with none, `lease` is `none`.
 
 ### Run as the runner account
 

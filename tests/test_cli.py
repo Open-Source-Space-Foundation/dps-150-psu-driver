@@ -438,11 +438,13 @@ def test_status_reports_the_supply_and_the_local_state(bench, capsys, argv):
         "measured_voltage": "8.200",
         "measured_current": "0.500",
         "measured_power": "4.100",
-        "limit": "10 V / 1.5 A",
+        "ovp": "30.000",
+        "ocp": "5.100",
+        "max_voltage": "11.800",
         "inhibit": "clear",
         "lease": "none",
     }
-    assert 1 not in bench.db_writes()
+    assert bench.sets() == []
 
 
 def test_status_shows_latch_and_lease(bench, capsys):
@@ -469,5 +471,91 @@ def test_status_works_without_a_run_dir(bench, capsys):
     assert _status_lines(capsys.readouterr().out)["lease"] == "none"
 
 
+def test_status_needs_no_limit_in_the_environment(bench):
+    assert bench.run(env={}) == cli.EXIT_OK
+
+
+def test_status_after_a_ci_output_on_leaves_the_supply_protection_alone(bench):
+    """Catches status reprogramming OVP/OCP from the caller's env on a live supply."""
+    assert bench.run("--output", "1", "--lease", "600") == cli.EXIT_OK
+    assert bench.run("--status", env={"PSU_MAX_V": "18", "PSU_MAX_I": "3"}) == cli.EXIT_OK
+    assert unpack_f32(bench.serial.registers[0xD1]) == pytest.approx(10.0)
+    assert unpack_f32(bench.serial.registers[0xD2]) == pytest.approx(1.5)
+    assert bench.serial.registers[0xDB] == b"\x01"
+
+
+def test_status_with_a_limit_flag_writes_nothing(bench):
+    """Catches status lowering OVP below the running setpoint so the supply trips."""
+    assert bench.run("--output", "1", "--lease", "600") == cli.EXIT_OK
+    before = len(bench.serial.written)
+    assert bench.run("--status", "--max-voltage", "5") == cli.EXIT_OK
+    assert [f for f in bench.serial.written[before:] if f[1] == CMD_SET] == []
+    assert unpack_f32(bench.serial.registers[0xD1]) == pytest.approx(10.0)
+
+
+def test_status_get_failure_leaves_the_output_on_and_exits_1(bench):
+    """Catches the session-open recovery turning a live output off because a GET failed."""
+    assert bench.run("--output", "1", "--lease", "600") == cli.EXIT_OK
+    bench.serial.silent.add(0xDE)
+    assert bench.run("--status") == cli.EXIT_DEVICE
+    assert bench.serial.registers[0xDB] == b"\x01"
+    assert bench.db_writes() == [1]
+
+
+def test_status_sends_no_set_frame(bench):
+    assert bench.run() == cli.EXIT_OK
+    assert [f for f in bench.serial.written if f[1] == CMD_SET] == []
+
+
 def test_missing_port_is_a_usage_error():
     assert cli.main([], env=ENV) == cli.EXIT_USAGE
+
+
+# Option order and a missing port path
+
+
+@pytest.mark.parametrize("command", ["kill", "clear-inhibit"])
+def test_kill_and_clear_inhibit_accept_global_options_after_the_subcommand(bench, command):
+    """Catches the panic command failing on `dps150 kill -d PORT`."""
+    bench.serial.registers[0xDB] = b"\x01"
+    args = [command, "-d", str(bench.port), "--state-dir", str(bench.state_dir)]
+    args += ["--run-dir", str(bench.run_dir)]
+    code = cli.main(
+        args,
+        env={},
+        serial_factory=lambda path: bench.serial,
+        usb_id=lambda path: bench.ids,
+        usb_serial=lambda path: bench.usb_serial,
+        clock=bench.clock,
+    )
+    assert code == cli.EXIT_OK
+    if command == "kill":
+        assert bench.latch_path.exists()
+        assert bench.db_writes() == [0]
+
+
+@pytest.mark.parametrize("argv", [(), ("--output", "1", "--lease", "60"), ("--output", "0")])
+def test_missing_port_path_exits_5_before_the_wire(bench, capsys, argv):
+    """Catches three different messages and codes for one cause: the supply is unplugged."""
+    bench.port.unlink()
+    assert bench.run(*argv) == cli.EXIT_WRONG_DEVICE
+    assert bench.serial.written == []
+    assert f"port {bench.port} does not exist (supply unplugged" in capsys.readouterr().err
+
+
+def test_kill_with_a_missing_port_path_still_latches(bench, capsys):
+    bench.port.unlink()
+    assert bench.run("kill") == cli.EXIT_WRONG_DEVICE
+    assert bench.latch_path.exists()
+    assert bench.serial.written == []
+    err = capsys.readouterr().err
+    assert "INHIBIT LATCH IS SET" in err and "does not exist" in err
+
+
+def test_env_limit_above_the_ceiling_is_refused_even_with_a_lowering_flag(bench, capsys):
+    """Catches a lowering flag masking a misconfigured PSU_MAX_V."""
+    env = ENV | {"PSU_MAX_V": "100"}
+    code = bench.run("--max-voltage", "10", "--output", "1", "--lease", "60", env=env)
+    assert code == cli.EXIT_USAGE
+    assert bench.serial.written == []
+    assert "ceiling" in capsys.readouterr().err
