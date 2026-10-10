@@ -18,7 +18,7 @@ from dps150.driver import (
     ReadbackMismatch,
     WrongDevice,
 )
-from dps150.protocol import CMD_GET, CMD_SESSION, CMD_SET, encode, pack_f32
+from dps150.protocol import CMD_GET, CMD_SESSION, CMD_SET, encode, pack_f32, unpack_f32
 from dps150.testing import FakeClock, MockSerial
 
 PORT = "/dev/serial/by-id/usb-FNIRSI_DPS-150_ABC123-if00"
@@ -492,3 +492,333 @@ def test_allowlist_scan_catches_a_forbidden_frame_the_driver_might_swallow():
     with pytest.raises(AssertionError):
         assert_only_allowlisted_commands([port])
     port.written.clear()
+
+
+# Fix-forward round 1 (PR #24 review): fail-closed read-backs, limit bound, echo, emergency off
+
+
+NAN = pack_f32(math.nan)
+
+
+def make_nan_supply(nan_registers):
+    """A supply whose GET of any register in `nan_registers` (a live set) replies NaN."""
+    supply, port, clock = make_supply(max_voltage=10.0, max_current=3.0)
+    original_reply = port._reply
+
+    def reply(register):
+        if register in nan_registers:
+            port.push(bytes([0xF0, 0xA1, register, 4, *NAN, (register + 4 + sum(NAN)) & 0xFF]))
+        else:
+            original_reply(register)
+
+    port._reply = reply
+    return supply, port
+
+
+@pytest.mark.parametrize("register", [0xD1, 0xD2])
+def test_open_rejects_a_nan_protection_readback(register):
+    supply, port = make_nan_supply({register})
+    with pytest.raises(ReadbackMismatch):
+        supply.open()
+    assert OUTPUT_ON not in port.written
+
+
+@pytest.mark.parametrize("register", [0xC1, 0xC2, 0xD1, 0xD2, 0xE2])
+def test_output_on_rejects_a_nan_readback(register):
+    nan_registers = set()
+    supply, port = make_nan_supply(nan_registers)
+    supply.open()
+    nan_registers.add(register)
+    with pytest.raises(ReadbackMismatch):
+        supply.output(True)
+    assert OUTPUT_ON not in port.written
+    assert port.registers[0xDB] == b"\x00"
+
+
+def test_set_voltage_rejects_a_nan_e2_readback():
+    supply, port = make_nan_supply({0xE2})
+    supply.open()
+    with pytest.raises(ReadbackMismatch):
+        supply.set_voltage(5.0)
+    assert writes_of(port, CMD_SET, 0xC1) == []
+
+
+@pytest.mark.parametrize("ovp", [10.005, 10.01])
+def test_open_rejects_ovp_readback_above_the_limit_within_tolerance(ovp):
+    supply, port, _ = make_supply(max_voltage=10.0, max_current=3.0)
+    port.drop_sets.add(0xD1)
+    port.registers[0xD1] = pack_f32(ovp)
+    with pytest.raises(ReadbackMismatch):
+        supply.open()
+
+
+@pytest.mark.parametrize("register, value", [(0xD1, 10.005), (0xD2, 3.0005)])
+def test_output_on_rejects_protection_above_the_limit_within_tolerance(register, value):
+    supply, port, _ = make_supply(max_voltage=10.0, max_current=3.0)
+    supply.open()
+    port.registers[register] = pack_f32(value)
+    with pytest.raises(ReadbackMismatch):
+        supply.output(True)
+    assert OUTPUT_ON not in port.written
+
+
+@pytest.mark.parametrize("register, value", [(0xC1, 10.005), (0xC2, 3.0005)])
+def test_output_on_rejects_a_front_panel_setpoint_above_the_limit_within_tolerance(register, value):
+    supply, port, _ = make_supply(max_voltage=10.0, max_current=3.0)
+    supply.open()
+    port.registers[register] = pack_f32(value)
+    with pytest.raises(ClampError):
+        supply.output(True)
+    assert OUTPUT_ON not in port.written
+
+
+def test_limit_that_float32_rounds_down_still_accepts_a_setpoint_at_the_limit():
+    supply, port, _ = make_supply(max_voltage=3.3, max_current=0.7)
+    supply.open()
+    supply.set_voltage(3.3)
+    supply.set_current(0.7)
+    supply.output(True)
+    assert port.registers[0xDB] == b"\x01"
+
+
+def test_limit_that_float32_rounds_up_still_accepts_the_programmed_protection():
+    supply, port, _ = make_supply(max_voltage=0.1, max_current=0.1)
+    supply.open()
+    supply.output(True)
+    assert port.registers[0xDB] == b"\x01"
+
+
+@pytest.mark.parametrize("register", [0xD1, 0xD2])
+def test_open_fails_when_the_device_echoes_but_ignores_the_protection_write(register):
+    supply, port, _ = make_supply(echo_sets=True)
+    port.drop_sets.add(register)
+    with pytest.raises(ReadbackMismatch):
+        supply.open()
+    assert OUTPUT_ON not in port.written
+
+
+def test_set_voltage_fails_when_the_device_echoes_but_ignores_the_write():
+    supply, port, _ = make_supply(echo_sets=True)
+    supply.open()
+    port.drop_sets.add(0xC1)
+    with pytest.raises(ReadbackMismatch):
+        supply.set_voltage(3.3)
+
+
+def test_set_current_fails_when_the_device_echoes_but_ignores_the_write():
+    supply, port, _ = make_supply(echo_sets=True)
+    supply.open()
+    port.drop_sets.add(0xC2)
+    with pytest.raises(ReadbackMismatch):
+        supply.set_current(0.5)
+
+
+def test_output_on_fails_when_the_device_echoes_but_ignores_the_write():
+    supply, port, _ = make_supply(echo_sets=True)
+    supply.open()
+    port.drop_sets.add(0xDB)
+    with pytest.raises(ReadbackMismatch):
+        supply.output(True)
+    assert port.registers[0xDB] == b"\x00"
+
+
+def test_get_flushes_input_right_before_each_send():
+    supply, port, _ = make_supply()
+    supply.open()
+    stale = bytes([0xF0, 0xA1, 0xC1, 4, *pack_f32(9.0), (0xC1 + 4 + sum(pack_f32(9.0))) & 0xFF])
+    port.push(stale)
+    assert supply.status().voltage_setpoint == 0.0
+
+
+# open() failure after session start: best-effort output off before session stop
+
+
+def test_open_failure_attempts_output_off_before_session_stop():
+    supply, port, _ = make_supply()
+    port.drop_sets.add(0xD1)
+    port.registers[0xDB] = b"\x01"
+    with pytest.raises(ReadbackMismatch):
+        supply.open()
+    assert port.registers[0xDB] == b"\x00"
+    assert index_of(port, OUTPUT_OFF) < index_of(port, SESSION_STOP)
+    assert index_of(port, get_frame(0xDB)) > index_of(port, OUTPUT_OFF)
+    assert port.written[-1] == SESSION_STOP
+    assert port.closed
+
+
+def test_open_failure_output_off_failure_does_not_mask_the_original_error():
+    supply, port, _ = make_supply()
+    port.drop_sets.update({0xD1, 0xDB})
+    port.registers[0xDB] = b"\x01"
+    with pytest.raises(ReadbackMismatch, match="OVP") as info:
+        supply.open()
+    assert any("output" in note for note in info.value.__notes__)
+    assert port.written[-1] == SESSION_STOP
+    assert port.closed
+    assert not supply.is_open
+
+
+def test_open_failure_session_stop_failure_does_not_mask_the_original_error():
+    supply, port, _ = make_supply()
+    port.silent.add(0xD2)
+    original_write = port.write
+
+    def failing_stop(data):
+        if data == SESSION_STOP:
+            raise OSError("port vanished")
+        return original_write(data)
+
+    port.write = failing_stop
+    with pytest.raises(NoReply) as info:
+        supply.open()
+    assert any("OSError" in note for note in info.value.__notes__)
+    assert port.closed
+    assert not supply.is_open
+
+
+# output(True) recovery precedence
+
+
+def test_output_on_recovery_failure_does_not_mask_the_original_error():
+    supply, port, _ = make_supply()
+    supply.open()
+    port.registers[0xC1] = pack_f32(50.0)
+    port.registers[0xDB] = b"\x01"
+    port.drop_sets.add(0xDB)
+    with pytest.raises(ClampError) as info:
+        supply.output(True)
+    assert any("output" in note for note in info.value.__notes__)
+
+
+def test_output_on_interrupted_between_write_and_confirm_still_turns_off():
+    supply, port, _ = make_supply()
+    supply.open()
+    original_write = port.write
+    interrupted = []
+
+    def interrupt_once(data):
+        if data == get_frame(0xDB) and not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return original_write(data)
+
+    port.write = interrupt_once
+    with pytest.raises(KeyboardInterrupt):
+        supply.output(True)
+    assert writes_of(port, CMD_SET, 0xDB) == [OUTPUT_ON, OUTPUT_OFF]
+    assert port.registers[0xDB] == b"\x00"
+
+
+# Input domain of the clamp and the limit
+
+
+@pytest.mark.parametrize("bad", ["5", None, b"\x00", True, False, 1j])
+def test_set_voltage_rejects_non_real_or_bool_with_clamp_error(bad):
+    supply, port, _ = make_supply()
+    supply.open()
+    with pytest.raises(ClampError):
+        supply.set_voltage(bad)
+    with pytest.raises(ClampError):
+        supply.set_current(bad)
+    assert writes_of(port, CMD_SET, 0xC1) == []
+    assert writes_of(port, CMD_SET, 0xC2) == []
+
+
+@pytest.mark.parametrize("bad", ["5", True, b"\x00", 1j])
+def test_limit_rejects_non_real_or_bool_with_limit_error(bad):
+    with pytest.raises(LimitError):
+        Dps150(PORT, max_voltage=bad, max_current=1.0)
+    with pytest.raises(LimitError):
+        Dps150(PORT, max_voltage=5.0, max_current=bad)
+
+
+def test_negative_zero_setpoint_is_accepted():
+    supply, port, _ = make_supply()
+    supply.open()
+    supply.set_voltage(-0.0)
+    assert unpack_f32(port.registers[0xC1]) == 0.0
+
+
+# USB serial number
+
+
+def test_serial_number_comes_from_the_injected_usb_serial_lookup():
+    supply, _, _ = make_supply()
+    supply._usb_serial = lambda path: "ABC123"
+    assert supply.serial_number == "ABC123"
+
+
+def test_usb_serial_is_none_for_a_path_that_is_not_a_listed_port():
+    from dps150.driver import usb_serial
+
+    assert usb_serial("/dev/definitely-not-a-port") is None
+
+
+# force_output_off
+
+
+def force_output_off(*args, **kwargs):
+    from dps150.driver import force_output_off
+
+    return force_output_off(*args, **kwargs)
+
+
+def make_force_off_port(**port_kwargs):
+    clock = FakeClock()
+    port = MockSerial(clock=clock, **port_kwargs)
+    port.registers.update(FACTORY_REGISTERS)
+    port.registers[0xDB] = b"\x01"
+    return port, clock
+
+
+def test_force_output_off_writes_db_0_confirms_and_stops_the_session():
+    port, clock = make_force_off_port()
+    force_output_off(PORT, serial_factory=lambda path: port, usb_id=dps150_usb_id, clock=clock)
+    assert port.registers[0xDB] == b"\x00"
+    assert port.written[0] == SESSION_START
+    assert index_of(port, get_frame(0xDB)) > index_of(port, OUTPUT_OFF)
+    assert port.written[-1] == SESSION_STOP
+    assert port.closed
+    registers_touched = {f[2] for f in port.written if f[1] in (CMD_SET, CMD_GET)}
+    assert registers_touched == {0xDB}
+
+
+def test_force_output_off_refuses_the_wrong_device_before_opening_the_port():
+    opened = []
+    with pytest.raises(WrongDevice):
+        force_output_off(
+            PORT, serial_factory=lambda path: opened.append(path), usb_id=lambda path: None
+        )
+    assert opened == []
+
+
+def test_force_output_off_raises_when_the_device_stays_on():
+    port, clock = make_force_off_port()
+    port.drop_sets.add(0xDB)
+    with pytest.raises(ReadbackMismatch):
+        force_output_off(PORT, serial_factory=lambda path: port, usb_id=dps150_usb_id, clock=clock)
+    assert port.written[-1] == SESSION_STOP
+    assert port.closed
+
+
+def test_force_output_off_raises_when_the_confirm_gets_no_reply():
+    port, clock = make_force_off_port()
+    port.silent.add(0xDB)
+    with pytest.raises(NoReply):
+        force_output_off(PORT, serial_factory=lambda path: port, usb_id=dps150_usb_id, clock=clock)
+    assert port.written[-1] == SESSION_STOP
+
+
+def test_force_output_off_ignores_a_set_echo_and_confirms_by_get():
+    port, clock = make_force_off_port(echo_sets=True)
+    port.drop_sets.add(0xDB)
+    with pytest.raises(ReadbackMismatch):
+        force_output_off(PORT, serial_factory=lambda path: port, usb_id=dps150_usb_id, clock=clock)
+
+
+def test_force_output_off_is_exported_from_the_package():
+    import dps150
+    from dps150 import driver
+
+    assert dps150.force_output_off is driver.force_output_off
+    assert dps150.usb_serial is driver.usb_serial
