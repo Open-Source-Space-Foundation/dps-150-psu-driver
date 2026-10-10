@@ -49,7 +49,7 @@ class Limit:
     current: float
 
 
-CEILING = Limit(10.0, 3.0)
+CEILING = Limit(18.0, 3.0)
 
 
 class Dps150Error(Exception):
