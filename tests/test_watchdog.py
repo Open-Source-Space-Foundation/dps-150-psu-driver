@@ -322,3 +322,67 @@ def test_live_lease_does_not_touch_the_port_lock(tmp_path, caplog):
         os.close(holder)
     assert caplog.records == []
     assert bench.output_is_on()
+
+
+def test_tick_pets_systemd_after_each_lease(tmp_path):
+    bench = Bench(tmp_path)
+    pets = []
+    bench.watchdog._notify = pets.append
+    bench.lease(60)
+    bench.lease(60, serial="OTHER")
+    bench.ports["OTHER"] = str(bench.port_path)
+    bench.now = T0 + timedelta(seconds=61)
+    bench.watchdog.tick()
+    assert pets == ["WATCHDOG=1", "WATCHDOG=1"]
+
+
+def test_a_timed_out_write_on_one_supply_does_not_block_the_next(tmp_path, caplog):
+    """Probe p2: a wedged CDC write. With open_serial's write timeout pyserial raises
+    SerialTimeoutException; the lease stays for the next poll and the tick goes on."""
+    import serial
+
+    class WedgedSerial(MockSerial):
+        def write(self, data):
+            raise serial.SerialTimeoutException("Write timeout")
+
+    wedged = WedgedSerial()
+    bench = Bench(tmp_path, serial_factory=lambda path: wedged)
+    pets = []
+    bench.watchdog._notify = pets.append
+    bench.lease(60, serial="WEDGED")
+    bench.ports["WEDGED"] = str(bench.port_path)
+    bench.lease(60)
+    bench.ports[SERIAL] = str(tmp_path / "ttyACM1")
+    (tmp_path / "ttyACM1").touch()
+    healthy, clock = make_supply_on()
+    bench.watchdog._force_output_off = lambda port: force_output_off(
+        port,
+        serial_factory=lambda path: wedged if path == str(bench.port_path) else healthy,
+        usb_id=dps150_usb_id,
+        clock=clock,
+    )
+    bench.now = T0 + timedelta(seconds=61)
+    with caplog.at_level(logging.ERROR, logger="dps150.watchdog"):
+        bench.watchdog.tick()
+    assert healthy.registers[0xDB] == b"\x00"
+    assert not bench.lease_exists()
+    assert bench.lease_exists("WEDGED")
+    assert "Write timeout" in caplog.text
+    assert pets == ["WATCHDOG=1", "WATCHDOG=1"]
+
+
+def test_lease_order_rotates_with_the_clock_so_a_hanging_lease_cannot_starve_the_rest(tmp_path):
+    """systemd kills a wedged tick and restarts the service with no memory of which lease
+    hung, so the rotation must come from something that survives a restart: the clock."""
+    bench = Bench(tmp_path)
+    for serial in ("A", "B", "C"):
+        bench.lease(60, serial=serial)
+    attempted = []
+    bench.watchdog._find_port = lambda serial: attempted.append(serial)
+    orders = set()
+    for second in range(61, 67):
+        attempted.clear()
+        bench.now = T0 + timedelta(seconds=second)
+        bench.watchdog.tick()
+        orders.add(tuple(attempted))
+    assert orders == {("A", "B", "C"), ("B", "C", "A"), ("C", "A", "B")}

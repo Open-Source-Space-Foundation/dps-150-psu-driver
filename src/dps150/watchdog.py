@@ -4,6 +4,9 @@ Each poll reads every lease in the run dir. For an expired one it takes the port
 re-reads the lease (the holder may have renewed while we waited), turns the output off
 with `force_output_off`, and removes the lease. Expiry never sets the inhibit latch.
 Any failure is logged and retried on the next poll; the loop itself never dies on one.
+
+systemd is petted after every lease, so `WatchdogSec` only has to cover one supply's
+worst case: the lock timeout, three unanswered GETs, and a timed-out write (about 6 s).
 """
 
 from __future__ import annotations
@@ -79,13 +82,26 @@ class Watchdog:
 
     def tick(self) -> None:
         """One poll over every lease. Never raises on a single supply's failure."""
-        for lease in list_leases(self.run_dir):
+        for lease in self._rotated(list_leases(self.run_dir)):
             try:
                 self._enforce(lease)
             except Exception as exc:
                 self._report_failure(lease.serial, f"{type(exc).__name__}: {exc}")
             else:
                 self._report_recovery(lease.serial)
+            self._notify("WATCHDOG=1")
+
+    def _rotated(self, leases: list[Lease]) -> list[Lease]:
+        """Leases in an order that starts somewhere else each second.
+
+        A supply whose enforcement hangs gets the service killed by systemd, which
+        restarts it with no memory of the culprit. Rotating on the clock, not on
+        in-process state, keeps that supply from heading the list on every restart.
+        """
+        if not leases:
+            return leases
+        start = int(self._now().timestamp()) % len(leases)
+        return leases[start:] + leases[:start]
 
     def _enforce(self, lease: Lease) -> None:
         if not lease.expired(self._now()):

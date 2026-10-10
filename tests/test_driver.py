@@ -17,6 +17,7 @@ from dps150.driver import (
     NoReply,
     ReadbackMismatch,
     WrongDevice,
+    open_serial,
 )
 from dps150.protocol import CMD_GET, CMD_SESSION, CMD_SET, encode, pack_f32, unpack_f32
 from dps150.testing import FakeClock, MockSerial
@@ -828,3 +829,21 @@ def test_force_output_off_is_exported_from_the_package():
 
     assert dps150.force_output_off is driver.force_output_off
     assert dps150.usb_serial is driver.usb_serial
+
+
+def test_open_serial_bounds_a_wedged_write(monkeypatch):
+    """A full CDC TX buffer on a hung device blocks write() forever without a write
+    timeout, which would hang the watchdog mid-tick. pyserial then raises
+    SerialTimeoutException, an OSError the session recovery already handles."""
+    import serial
+
+    opened = {}
+
+    def fake_serial(path, **kwargs):
+        opened.update(kwargs)
+        return MockSerial()
+
+    monkeypatch.setattr(serial, "Serial", fake_serial)
+    open_serial("/dev/ttyACM0")
+    assert opened["write_timeout"] == 1.0
+    assert issubclass(serial.SerialTimeoutException, OSError)
