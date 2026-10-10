@@ -23,6 +23,9 @@ USB_PID = 0x5740
 BAUD = 115200
 COMMAND_SPACING_S = 0.05
 POLL_TIMEOUT_S = 0.05
+# A hung device with a full CDC TX buffer blocks write() forever without this; with it
+# pyserial raises SerialTimeoutException (an OSError) that the session recovery handles.
+WRITE_TIMEOUT_S = 1.0
 REPLY_TIMEOUT_S = 1.0
 GET_ATTEMPTS = 3
 VOLTAGE_TOLERANCE_V = 0.01
@@ -136,7 +139,13 @@ def open_serial(path: str | os.PathLike[str]) -> SerialPort:
     import serial
 
     # No `exclusive=True`: the port lock in dps150.state flocks its own descriptor.
-    return serial.Serial(os.fspath(path), baudrate=BAUD, timeout=POLL_TIMEOUT_S, rtscts=False)
+    return serial.Serial(
+        os.fspath(path),
+        baudrate=BAUD,
+        timeout=POLL_TIMEOUT_S,
+        write_timeout=WRITE_TIMEOUT_S,
+        rtscts=False,
+    )
 
 
 class Dps150:
