@@ -832,3 +832,68 @@ def test_open_serial_bounds_a_wedged_write(monkeypatch):
     open_serial("/dev/ttyACM0")
     assert opened["write_timeout"] == 1.0
     assert issubclass(serial.SerialTimeoutException, OSError)
+
+
+# read_status
+
+
+def read_status(*args, **kwargs):
+    from dps150.driver import read_status
+
+    return read_status(*args, **kwargs)
+
+
+def make_live_port():
+    port, clock = make_force_off_port()
+    port.registers[0xC1] = pack_f32(8.2)
+    port.registers[0xD1] = pack_f32(10.0)
+    port.registers[0xD2] = pack_f32(1.5)
+    port.telemetry = (8.2, 0.5, 4.1)
+    return port, clock
+
+
+def test_read_status_reads_everything_and_writes_no_set():
+    """Catches a status path that programs OVP/OCP or touches DB on a live supply."""
+    port, clock = make_live_port()
+    snap = read_status(PORT, serial_factory=lambda path: port, usb_id=dps150_usb_id, clock=clock)
+    assert snap.model == "DPS-150"
+    assert snap.firmware == "V1.2"
+    assert snap.status.voltage_setpoint == pytest.approx(8.2)
+    assert snap.status.output is True
+    assert snap.ovp == pytest.approx(10.0)
+    assert snap.ocp == pytest.approx(1.5)
+    assert snap.max_voltage == pytest.approx(11.8)
+    assert snap.measurement.power == pytest.approx(4.1)
+    assert writes_of(port, CMD_SET, 0xDB) == []
+    assert [f for f in port.written if f[1] == CMD_SET] == []
+    assert port.written[0] == SESSION_START
+    assert port.written[-1] == SESSION_STOP
+    assert port.closed
+    assert port.registers[0xDB] == b"\x01"
+
+
+def test_read_status_refuses_the_wrong_device_before_opening_the_port():
+    opened = []
+    with pytest.raises(WrongDevice):
+        read_status(PORT, serial_factory=lambda path: opened.append(path), usb_id=lambda path: None)
+    assert opened == []
+
+
+def test_read_status_get_failure_stops_the_session_and_leaves_the_output_alone():
+    """Catches the Dps150.open recovery (DB=0 on failure) leaking into a read-only path."""
+    port, clock = make_live_port()
+    port.silent.add(0xDE)
+    with pytest.raises(NoReply):
+        read_status(PORT, serial_factory=lambda path: port, usb_id=dps150_usb_id, clock=clock)
+    assert [f for f in port.written if f[1] == CMD_SET] == []
+    assert port.registers[0xDB] == b"\x01"
+    assert port.written[-1] == SESSION_STOP
+    assert port.closed
+
+
+def test_read_status_is_exported_from_the_package():
+    import dps150
+    from dps150 import driver
+
+    assert dps150.read_status is driver.read_status
+    assert dps150.Snapshot is driver.Snapshot

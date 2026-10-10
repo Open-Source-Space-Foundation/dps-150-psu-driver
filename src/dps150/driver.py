@@ -12,7 +12,8 @@ import math
 import numbers
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -97,6 +98,19 @@ class Status:
     @property
     def protection_name(self) -> str:
         return PROTECTION_NAMES.get(self.protection, f"UNKNOWN({self.protection})")
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    """Everything `read_status` reads from a supply, including its own OVP/OCP trips."""
+
+    model: str
+    firmware: str
+    status: Status
+    measurement: Measurement
+    ovp: float
+    ocp: float
+    max_voltage: float
 
 
 class SerialPort(Protocol):
@@ -432,7 +446,46 @@ def force_output_off(
     read, no protection programming. Refuses any device other than a DPS-150. Raises
     (`ReadbackMismatch`, `NoReply`, or the port's error) when off is not confirmed.
     """
-    # The limit is never used on this path: only DB is written.
+    with _bare_session(port, serial_factory, usb_id, clock) as supply:
+        supply._output_off()
+
+
+def read_status(
+    port: str | os.PathLike[str],
+    *,
+    serial_factory: Callable[[str | os.PathLike[str]], SerialPort] = open_serial,
+    usb_id: Callable[[str | os.PathLike[str]], tuple[int, int] | None] = usb_id,
+    clock=time,
+) -> Snapshot:
+    """Read the supply without changing it: GETs only, never a SET, no limit needed.
+
+    Unlike `Dps150.open()`, a failed read does not turn the output off: this path
+    must be safe to run against a supply another job is using. The session is
+    stopped either way.
+    """
+    with _bare_session(port, serial_factory, usb_id, clock) as supply:
+        return Snapshot(
+            model=supply._get_str(REG_MODEL),
+            firmware=supply._get_str(REG_FIRMWARE),
+            status=supply.status(),
+            ovp=supply._get_f32(REG_OVP),
+            ocp=supply._get_f32(REG_OCP),
+            measurement=supply.measure(),
+            max_voltage=supply._get_f32(REG_MAX_VOLTAGE),
+        )
+
+
+@contextmanager
+def _bare_session(
+    port: str | os.PathLike[str],
+    serial_factory: Callable[[str | os.PathLike[str]], SerialPort],
+    usb_id: Callable[[str | os.PathLike[str]], tuple[int, int] | None],
+    clock,
+) -> Iterator[Dps150]:
+    """A session with the USB check and nothing else: no reads, no protection programming.
+
+    The ceiling stands in for the limit; nothing on this path uses it.
+    """
     supply = Dps150(
         port,
         CEILING.voltage,
@@ -443,7 +496,7 @@ def force_output_off(
     )
     supply._start_session()
     try:
-        supply._output_off()
+        yield supply
     except BaseException as exc:
         supply._attempt(supply._end_session, exc, "session stop")
         raise
