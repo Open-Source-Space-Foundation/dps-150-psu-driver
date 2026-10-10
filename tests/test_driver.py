@@ -2,7 +2,7 @@ import math
 from itertools import pairwise
 
 import pytest
-from conftest import assert_only_allowlisted_commands
+from conftest import FACTORY_REGISTERS, assert_only_allowlisted_commands
 
 from dps150.driver import (
     CEILING,
@@ -27,21 +27,6 @@ SESSION_START = encode(CMD_SESSION, 0x00, b"\x01")
 SESSION_STOP = encode(CMD_SESSION, 0x00, b"\x00")
 OUTPUT_ON = encode(CMD_SET, 0xDB, b"\x01")
 OUTPUT_OFF = encode(CMD_SET, 0xDB, b"\x00")
-
-FACTORY_REGISTERS = {
-    0xC1: pack_f32(0.0),
-    0xC2: pack_f32(0.0),
-    0xD1: pack_f32(30.0),
-    0xD2: pack_f32(5.1),
-    0xDB: b"\x00",
-    0xDC: b"\x05",
-    0xDD: b"\x01",
-    0xDE: b"DPS-150",
-    0xDF: b"V1.0",
-    0xE0: b"V1.2",
-    0xE2: pack_f32(11.8),
-    0xE3: pack_f32(5.1),
-}
 
 
 def dps150_usb_id(path):
