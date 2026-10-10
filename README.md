@@ -12,6 +12,8 @@ The driver compiles in a ceiling of 18 V / 3 A. No config or flag can raise it. 
 
 The supply outputs at most about 0.2 V below its USB-PD input (register `E2`). Reaching 18 V needs a USB-PD source that negotiates at least 18.2 V.
 
+Power the supply and the CI host from separate sources. Never share a USB-PD brick between them: when one port renegotiates, the brick drops both, which resets the host mid-job. See [ADR 0001](docs/adr/0001-layered-fail-safe.md#l0-measured-2026-10-10).
+
 Example runner `.env` for the CI flight controller:
 
 ```sh
