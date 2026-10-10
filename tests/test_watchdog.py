@@ -41,6 +41,8 @@ class Bench:
         self.port, self.clock = make_supply_on()
         self.off_calls = 0
         self.now = T0
+        self.ports = {SERIAL: str(self.port_path)}
+        """What USB reports: serial number to device path. A serial not listed is unplugged."""
 
         def force_off(port):
             self.off_calls += 1
@@ -54,7 +56,7 @@ class Bench:
         self.watchdog = Watchdog(
             self.run_dir,
             force_output_off=force_off,
-            find_port=lambda serial: None,
+            find_port=self.ports.get,
             now=lambda: self.now,
             lock_timeout=lock_timeout,
             notify=lambda state: None,
@@ -115,20 +117,38 @@ def test_lease_without_a_port_is_resolved_by_serial(tmp_path):
     bench = Bench(tmp_path)
     bench.run_dir.mkdir()
     lease_path(SERIAL, bench.run_dir).write_text("garbage")
-    bench.watchdog._find_port = lambda serial: str(bench.port_path) if serial == SERIAL else None
     bench.watchdog.tick()
     assert not bench.output_is_on()
 
 
-def test_lease_without_a_port_and_no_usb_match_is_logged_and_kept(tmp_path, caplog):
+def test_unplugged_supply_is_logged_once_and_its_lease_kept(tmp_path, caplog):
     bench = Bench(tmp_path)
-    bench.run_dir.mkdir()
-    lease_path(SERIAL, bench.run_dir).write_text("garbage")
-    with caplog.at_level(logging.ERROR, logger="dps150.watchdog"):
+    bench.lease(60)
+    bench.now = T0 + timedelta(seconds=61)
+    del bench.ports[SERIAL]
+    with caplog.at_level(logging.DEBUG, logger="dps150.watchdog"):
+        bench.watchdog.tick()
         bench.watchdog.tick()
     assert bench.output_is_on()
+    assert bench.port.written == []
     assert bench.lease_exists()
-    assert "not on USB" in caplog.text
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "not on USB" in errors[0].getMessage()
+
+
+def test_recorded_port_is_never_used_to_reach_another_supply(tmp_path):
+    """Supply A (expired lease, recorded on ttyACM0) is unplugged; supply B, with a live
+    lease, now sits on ttyACM0. The watchdog must not write to B through A's stale path."""
+    bench = Bench(tmp_path)
+    bench.lease(60, serial="A")
+    bench.lease(3600, serial="B")
+    bench.ports = {"B": str(bench.port_path)}
+    bench.watchdog._find_port = bench.ports.get
+    bench.now = T0 + timedelta(seconds=61)
+    bench.watchdog.tick()
+    assert bench.output_is_on()
+    assert bench.port.written == []
+    assert bench.lease_exists("A") and bench.lease_exists("B")
 
 
 @pytest.mark.parametrize(
@@ -143,6 +163,7 @@ def test_unplugged_supply_is_logged_and_the_loop_keeps_going(tmp_path, caplog, f
     bench = Bench(tmp_path, **fault)
     bench.lease(60)
     bench.lease(60, serial="OTHER")
+    bench.ports["OTHER"] = str(bench.port_path)
     bench.now = T0 + timedelta(seconds=61)
     with caplog.at_level(logging.DEBUG, logger="dps150.watchdog"):
         bench.watchdog.tick()

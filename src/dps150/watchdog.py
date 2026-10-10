@@ -90,9 +90,12 @@ class Watchdog:
     def _enforce(self, lease: Lease) -> None:
         if not lease.expired(self._now()):
             return
-        port = self._find_port(lease.serial) or lease.port
+        # Only the USB serial number identifies the supply. The path the lease records
+        # can belong to a different DPS-150 after a replug, and force_output_off checks
+        # VID:PID alone, so following it could cut a supply that holds a live lease.
+        port = self._find_port(lease.serial)
         if port is None:
-            raise LookupError("no port recorded in the lease and the supply is not on USB")
+            raise LookupError(f"supply {lease.serial} is not on USB; lease kept")
         with port_lock(port, self._lock_timeout):
             current = read_lease(lease.serial, self.run_dir)
             if current is None or not current.expired(self._now()):

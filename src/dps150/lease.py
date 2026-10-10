@@ -1,8 +1,10 @@
 """The lease: a wall-clock deadline that output-on requires and the watchdog enforces.
 
 A lease is `<run_dir>/<serial>.lease`, a JSON record of the deadline (UTC) and the port
-path the holder used. Write it under the port lock, before output-on; rewrite it to renew;
-remove it after output-off. See CONTEXT.md and ADR 0001 layer 4.
+path the holder used. The serial number is the key; the port is for logs only, since the
+watchdog reaches a supply through its USB serial number and never through a recorded path.
+Write it under the port lock, before output-on; rewrite it to renew; remove it after
+output-off. See CONTEXT.md and ADR 0001 layer 4.
 """
 
 from __future__ import annotations
