@@ -559,3 +559,130 @@ def test_env_limit_above_the_ceiling_is_refused_even_with_a_lowering_flag(bench,
     assert code == cli.EXIT_USAGE
     assert bench.serial.written == []
     assert "ceiling" in capsys.readouterr().err
+
+
+# Device protection trip (bench #13: DC stays latched after a trip until SET DB=1)
+
+
+def _trip(bench, code):
+    bench.serial.registers[0xDC] = bytes([code])
+
+
+def _on(bench):
+    return bench.run("--output", "1", "--lease", "60")
+
+
+@pytest.mark.parametrize(
+    "code, name", [(1, "OVP"), (2, "OCP"), (3, "OPP"), (4, "OTP"), (6, "REP"), (9, "UNKNOWN(9)")]
+)
+def test_tripped_protection_latches_and_refuses_output_on(bench, capsys, code, name):
+    """Catches re-energizing a faulted board: DB=1 would clear the trip and turn the output on."""
+    _trip(bench, code)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert 1 not in bench.db_writes()
+    assert bench.serial.registers[0xDB] == b"\x00"
+    assert bench.serial.registers[0xDC] == bytes([code])
+    latch = state.read_latch(SERIAL, bench.state_dir)
+    assert latch.reason == f"device protection tripped: {name}"
+    err = capsys.readouterr().err
+    assert name in err and "clear-inhibit" in err
+
+
+def test_lvp_does_not_block_output_on(bench):
+    """Catches treating LVP as a trip: a healthy unit on a 5 V USB input reports it (#13)."""
+    _trip(bench, 5)
+    assert _on(bench) == cli.EXIT_OK
+    assert bench.db_writes() == [1]
+    assert not bench.latch_path.exists()
+
+
+def test_clear_inhibit_acknowledges_the_trip_for_one_output_on(bench):
+    """Catches a latch that can never be cleared: only DB=1 clears DC, so the acknowledged
+    output-on must proceed with DC still tripped, and the next trip must latch again."""
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    assert _on(bench) == cli.EXIT_OK
+    assert bench.serial.registers[0xDB] == b"\x01"
+    assert bench.serial.registers[0xDC] == b"\x00"
+    assert not list(bench.state_dir.iterdir())
+    assert bench.run("--output", "0", env={}) == cli.EXIT_OK
+    _trip(bench, 2)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.db_writes().count(1) == 1
+    assert state.read_latch(SERIAL, bench.state_dir).reason == "device protection tripped: OCP"
+
+
+def test_acknowledgement_covers_only_the_trip_that_was_cleared(bench):
+    """Catches an OVP acknowledgement waving through a trip that appeared after the clear."""
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    _trip(bench, 4)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert 1 not in bench.db_writes()
+    assert state.read_latch(SERIAL, bench.state_dir).reason == "device protection tripped: OTP"
+
+
+def test_clearing_a_kill_latch_does_not_acknowledge_a_trip(bench):
+    """Catches any clear-inhibit counting as a trip acknowledgement."""
+    state.set_latch(SERIAL, who="thermal", reason="hot", state_dir=bench.state_dir)
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert 1 not in bench.db_writes()
+
+
+def test_unreadable_acknowledgement_is_no_acknowledgement(bench):
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    (bench.state_dir / f"{SERIAL}.ack").write_text("{not json")
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert 1 not in bench.db_writes()
+
+
+def test_acknowledgement_is_consumed_by_a_confirmed_output_on_even_when_unused(bench):
+    """Catches a stale acknowledgement permitting a trip weeks later without a human."""
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    _trip(bench, 0)
+    assert _on(bench) == cli.EXIT_OK
+    assert not (bench.state_dir / f"{SERIAL}.ack").exists()
+    assert bench.run("--output", "0", env={}) == cli.EXIT_OK
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+
+
+def test_acknowledgement_survives_a_failed_output_on(bench):
+    """Catches consuming the acknowledgement before the output is confirmed on."""
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    bench.serial.drop_sets = {0xDB}
+    assert _on(bench) == cli.EXIT_DEVICE
+    bench.serial.drop_sets = set()
+    assert _on(bench) == cli.EXIT_OK
+
+
+def test_kill_discards_an_acknowledgement(bench):
+    _trip(bench, 1)
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    assert bench.run("kill", env={}) == cli.EXIT_OK
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    assert _on(bench) == cli.EXIT_INHIBITED
+
+
+def test_status_shows_the_trip_and_the_acknowledgement(bench, capsys):
+    _trip(bench, 1)
+    assert bench.run() == cli.EXIT_OK
+    assert _status_lines(capsys.readouterr().out)["protection"] == "OVP (tripped)"
+    assert _on(bench) == cli.EXIT_INHIBITED
+    assert bench.run("clear-inhibit", env={}) == cli.EXIT_OK
+    assert "next output-on" in capsys.readouterr().out
+    assert bench.run() == cli.EXIT_OK
+    lines = _status_lines(capsys.readouterr().out)
+    assert lines["protection"] == "OVP (tripped)"
+    assert lines["inhibit"].startswith("clear (trip OVP acknowledged by ")

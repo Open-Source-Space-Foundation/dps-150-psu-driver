@@ -110,3 +110,13 @@ def test_echo_sets_echoes_the_payload_even_when_the_write_is_dropped():
     (frame,) = FrameDecoder().feed(port.read(port.in_waiting))
     assert frame == Frame(0xC1, pack_f32(3.3))
     assert 0xC1 not in port.registers
+
+
+def test_set_db_1_clears_a_latched_protection_trip_and_db_0_does_not():
+    """Mirrors the DPS-150 V1.2: DC stays latched through output-off until SET DB=1 (#13)."""
+    port, _ = make_port()
+    port.registers[0xDC] = b"\x01"
+    port.write(encode(CMD_SET, 0xDB, b"\x00"))
+    assert port.registers[0xDC] == b"\x01"
+    port.write(encode(CMD_SET, 0xDB, b"\x01"))
+    assert port.registers[0xDC] == b"\x00"

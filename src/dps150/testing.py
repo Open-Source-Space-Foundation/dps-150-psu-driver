@@ -14,6 +14,8 @@ from .protocol import (
 )
 
 TELEMETRY_REGISTER = 0xC3
+OUTPUT_REGISTER = 0xDB
+PROTECTION_REGISTER = 0xDC
 TELEMETRY_PERIOD_S = 0.5
 
 
@@ -50,6 +52,9 @@ class MockSerial:
     like a device that refuses the write; a GET of a register in `silent` gets no reply;
     with `echo_sets` every valid SET is echoed as a device frame carrying the written
     payload, stored or not, like a device whose echo says nothing about acceptance.
+
+    A stored `SET DB=1` resets the protection register DC to 0, as the DPS-150 V1.2 does
+    after a trip (bench #13); `SET DB=0` leaves DC as it is.
     """
 
     def __init__(
@@ -85,6 +90,8 @@ class MockSerial:
             if command == CMD_SET:
                 if register not in self.drop_sets:
                     self.registers[register] = payload
+                    if register == OUTPUT_REGISTER and payload == b"\x01":
+                        self.registers[PROTECTION_REGISTER] = b"\x00"
                 if self.echo_sets:
                     self.push(_device_frame(register, payload))
             elif command == CMD_GET and register not in self.silent:

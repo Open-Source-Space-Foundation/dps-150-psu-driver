@@ -23,6 +23,7 @@ from .driver import (
     Dps150Error,
     Limit,
     LimitError,
+    ProtectionTripped,
     Snapshot,
     WrongDevice,
     _validated_limit,
@@ -274,13 +275,24 @@ def output_on(cfg: Config, serial: str | None, device: Device) -> None:
             supply.set_voltage(cfg.voltage)
             supply.set_current(cfg.current)
             state.check_not_inhibited(serial, cfg.state_dir)
+            ack = state.read_ack(serial, cfg.state_dir)
             lease = write_lease(serial, cfg.port, cfg.lease_s, cfg.run_dir)
             # A failure from here on leaves the lease in place on purpose (README, "CLI").
-            supply.output(True)
+            try:
+                supply.output(True, allow_tripped=None if ack is None else ack.trip)
+            except ProtectionTripped as exc:
+                raise Inhibited(serial, _latch_trip(serial, exc, cfg.state_dir)) from exc
+            state.consume_ack(serial, cfg.state_dir)
     print(
         f"output on: {cfg.voltage:g} V / {cfg.current:g} A, "
         f"lease until {lease.deadline.isoformat()}"
     )
+
+
+def _latch_trip(serial: str, exc: ProtectionTripped, state_dir: Path) -> state.Latch:
+    """A device protection trip escalates to the inhibit latch (ADR 0001, 2026-10-10 note)."""
+    reason = f"device protection tripped: {exc.name}"
+    return state.set_latch(serial, state._current_user(), reason, state_dir, trip=exc.name)
 
 
 def output_off(cfg: Config, serial: str | None, device: Device) -> None:
@@ -350,6 +362,11 @@ def clear_inhibit(cfg: Config, serial: str | None) -> None:
             f"supply {serial}: inhibit latch cleared "
             f"(set by {latch.who} at {latch.when.isoformat()}: {latch.reason})"
         )
+        if latch.trip is not None:
+            print(
+                f"trip {latch.trip} acknowledged: the next output-on may proceed while the "
+                f"supply still reports {latch.trip}; output-on is what clears it"
+            )
 
 
 def status(cfg: Config, serial: str | None, device: Device) -> None:
@@ -359,7 +376,17 @@ def status(cfg: Config, serial: str | None, device: Device) -> None:
         snap = device.read_status(cfg.port)
     st, m = snap.status, snap.measurement
     latch = state.read_latch(serial, cfg.state_dir)
+    ack = state.read_ack(serial, cfg.state_dir)
     lease = read_lease(serial, cfg.run_dir)
+    if latch is not None:
+        inhibit_line = f"latched by {latch.who} at {latch.when.isoformat()}: {latch.reason}"
+    elif ack is not None:
+        inhibit_line = (
+            f"clear (trip {ack.trip} acknowledged by {ack.who} at {ack.when.isoformat()}; "
+            "the next output-on may proceed)"
+        )
+    else:
+        inhibit_line = "clear"
     if lease is None:
         lease_line = "none"
     elif lease.deadline is None:
@@ -373,7 +400,7 @@ def status(cfg: Config, serial: str | None, device: Device) -> None:
         "voltage_setpoint": f"{st.voltage_setpoint:.3f}",
         "current_setpoint": f"{st.current_setpoint:.3f}",
         "output": "on" if st.output else "off",
-        "protection": st.protection_name,
+        "protection": f"{st.protection_name} (tripped)" if st.tripped else st.protection_name,
         "mode": st.mode,
         "measured_voltage": f"{m.voltage:.3f}",
         "measured_current": f"{m.current:.3f}",
@@ -381,9 +408,7 @@ def status(cfg: Config, serial: str | None, device: Device) -> None:
         "ovp": f"{snap.ovp:.3f}",
         "ocp": f"{snap.ocp:.3f}",
         "max_voltage": f"{snap.max_voltage:.3f}",
-        "inhibit": "clear"
-        if latch is None
-        else f"latched by {latch.who} at {latch.when.isoformat()}: {latch.reason}",
+        "inhibit": inhibit_line,
         "lease": lease_line,
     }
     for key, value in lines.items():

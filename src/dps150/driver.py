@@ -45,6 +45,14 @@ REG_FIRMWARE = 0xE0
 REG_MAX_VOLTAGE = 0xE2
 
 PROTECTION_NAMES = {0: "OK", 1: "OVP", 2: "OCP", 3: "OPP", 4: "OTP", 5: "LVP", 6: "REP"}
+# A healthy unit on a 5 V USB input reports LVP (bench #13), so LVP is not a board fault.
+# Every other non-zero code, REP (a reverse-connected output) and codes this table does
+# not know included, is a trip: the supply turned its output off for a reason on the board.
+PROTECTION_CLEAR = frozenset({0, 5})
+
+
+def protection_name(code: int) -> str:
+    return PROTECTION_NAMES.get(code, f"UNKNOWN({code})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +88,18 @@ class ReadbackMismatch(Dps150Error):
     """A register read back a value other than the one written, or a non-finite value."""
 
 
+class ProtectionTripped(Dps150Error):
+    """The supply's protection (DC) is tripped, and output-on would clear it and energize."""
+
+    def __init__(self, protection: int) -> None:
+        self.protection = protection
+        self.name = protection_name(protection)
+        super().__init__(
+            f"device protection tripped: {self.name}; output-on would clear the trip "
+            "and re-energize the board"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Measurement:
     voltage: float
@@ -97,7 +117,11 @@ class Status:
 
     @property
     def protection_name(self) -> str:
-        return PROTECTION_NAMES.get(self.protection, f"UNKNOWN({self.protection})")
+        return protection_name(self.protection)
+
+    @property
+    def tripped(self) -> bool:
+        return self.protection not in PROTECTION_CLEAR
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,11 +291,15 @@ class Dps150:
         self._verify_f32(REG_CURRENT_SETPOINT, amps, CURRENT_TOLERANCE_A, "current setpoint")
         self._declared_current = amps
 
-    def output(self, on: bool) -> None:
+    def output(self, on: bool, *, allow_tripped: str | None = None) -> None:
         """Switch the output, confirmed by reading DB back.
 
-        Output-on first re-verifies OVP/OCP and the setpoints on the supply. Any failure
-        on the way to a confirmed "on" writes DB=0 and raises.
+        Output-on first re-verifies OVP/OCP and the setpoints on the supply, then reads
+        the protection state. A trip (`Status.tripped`) raises `ProtectionTripped` unless
+        `allow_tripped` names that trip: on the DPS-150 the trip stays latched in DC
+        through output-off, and `SET DB=1` is what clears it (bench #13), so output-on
+        after a trip re-energizes the faulted board. Any failure on the way to a
+        confirmed "on" writes DB=0 and raises.
         """
         self._require_open()
         if not on:
@@ -280,6 +308,9 @@ class Dps150:
         try:
             self._verify_protection()
             self._verify_setpoints()
+            protection = self._get_u8(REG_PROTECTION)
+            if protection not in PROTECTION_CLEAR and protection_name(protection) != allow_tripped:
+                raise ProtectionTripped(protection)
             self._send(CMD_SET, REG_OUTPUT, b"\x01")
             self._verify_u8(REG_OUTPUT, 1, "output")
         except BaseException as exc:
